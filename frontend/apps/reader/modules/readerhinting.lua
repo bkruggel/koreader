@@ -25,27 +25,33 @@ function ReaderHinting:onHintPage(_, opportunistic)
         and self.ui.paging:getNextViewHint()
     if predicted and predicted.page >= 1
             and predicted.page <= self.document.info.number_of_pages then
+        -- Pure evaluation: getZoom would apply the *future* page's crop
+        -- decision to the view (c.f., ReaderZooming:getZoomForPage).
+        local zoom, use_bbox = self.zoom:getZoomForPage(predicted.page)
         self.document:hintPage(
             predicted.page,
-            self.zoom:getZoom(predicted.page),
+            zoom,
             self.view.state.rotation,
             self.view.state.gamma,
             self.view.state.saturation,
             predicted.rect,
-            opportunistic)
+            opportunistic,
+            use_bbox)
         -- Any remaining hint slots (DHINTCOUNT > 1) target the following
         -- pages at their forward entry edge.
         for i = 2, DHINTCOUNT do
             local pageno = self.view.state.page + i
             if pageno <= self.document.info.number_of_pages then
+                local z, ub = self.zoom:getZoomForPage(pageno)
                 self.document:hintPage(
                     pageno,
-                    self.zoom:getZoom(pageno),
+                    z,
                     self.view.state.rotation,
                     self.view.state.gamma,
                     self.view.state.saturation,
-                    self:getEntryEdgeRect(pageno, 1),
-                    opportunistic)
+                    self:getEntryEdgeRect(pageno, 1, z, ub),
+                    opportunistic,
+                    ub)
             end
         end
         return true
@@ -61,14 +67,16 @@ function ReaderHinting:onHintPage(_, opportunistic)
     for i = 1, DHINTCOUNT do
         local pageno = self.view.state.page + (dir > 0 and i or -i)
         if pageno >= 1 and pageno <= self.document.info.number_of_pages then
+            local zoom, use_bbox = self.zoom:getZoomForPage(pageno)
             self.document:hintPage(
                 pageno,
-                self.zoom:getZoom(pageno),
+                zoom,
                 self.view.state.rotation,
                 self.view.state.gamma,
                 self.view.state.saturation,
-                self:getEntryEdgeRect(pageno, dir),
-                opportunistic)
+                self:getEntryEdgeRect(pageno, dir, zoom, use_bbox),
+                opportunistic,
+                use_bbox)
         end
     end
     return true
@@ -77,10 +85,14 @@ end
 --- Viewport-sized rect at the edge page `pageno` is entered on: its top for
 -- forward turns, its bottom for backward ones. Matches the rect the first
 -- paint after the turn will request (ReaderView:recalculate anchors the view
--- at the entry edge, clamped to the page).
-function ReaderHinting:getEntryEdgeRect(pageno, dir)
-    local zoom = self.zoom:getZoom(pageno)
-    local page_area = self.view:getPageArea(pageno, zoom, self.view.state.rotation)
+-- at the entry edge, clamped to the page). `zoom`/`use_bbox` may be passed
+-- by a caller that already evaluated the page purely; otherwise they are
+-- computed here (still without touching view state).
+function ReaderHinting:getEntryEdgeRect(pageno, dir, zoom, use_bbox)
+    if not zoom then
+        zoom, use_bbox = self.zoom:getZoomForPage(pageno)
+    end
+    local page_area = self.view:getPageArea(pageno, zoom, self.view.state.rotation, use_bbox)
     local w = math.min(self.view.dimen.w, page_area.w)
     local h = self.view.dimen.h
     if self.view.footer_visible and self.view.footer

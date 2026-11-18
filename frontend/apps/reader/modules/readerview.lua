@@ -762,8 +762,13 @@ function ReaderView:drawHighlightRect(bb, _x, _y, rect, drawer, color, draw_note
     end
 end
 
-function ReaderView:getPageArea(page, zoom, rotation)
-    if self.use_bbox then
+function ReaderView:getPageArea(page, zoom, rotation, force_use_bbox)
+    -- force_use_bbox lets callers evaluate a page other than the displayed
+    -- one with that page's own crop decision (hint paths computing the rect
+    -- a future page is entered on): the view-global use_bbox flag tracks
+    -- the *displayed* page, c.f., ReaderZooming:getZoomForPage.
+    local use_bbox = force_use_bbox ~= nil and force_use_bbox or self.use_bbox
+    if use_bbox then
         return self.document:getUsedBBoxDimensions(page, zoom, rotation)
     else
         return self.document:getPageDimensions(page, zoom, rotation)

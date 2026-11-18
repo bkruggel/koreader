@@ -297,8 +297,15 @@ end
 --[[
 This method returns pagesize if bbox is corrupted
 --]]
-function Document:getUsedBBoxDimensions(pageno, zoom, rotation)
-    local bbox = self:getPageBBox(pageno)
+-- @tfield bool defer_busy when true and the background rasterization worker
+-- is mid-job, a needed bbox probe is *deferred* (stored/full-page bbox
+-- returned, nothing cached) instead of rendering the page on the main thread
+-- while the worker runs — two page-consuming MuPDF operations in flight at
+-- once. Used by the zoom/hint decision paths, where a probe can always be
+-- retried on a later evaluation; the reflow pipeline needs pixels now and
+-- never sets this.
+function Document:getUsedBBoxDimensions(pageno, zoom, rotation, defer_busy)
+    local bbox = self:getPageBBox(pageno, defer_busy)
     -- clipping page bbox
     if bbox.x0 < 0 then bbox.x0 = 0 end
     if bbox.y0 < 0 then bbox.y0 = 0 end
@@ -562,12 +569,24 @@ end
 -- cycle, c.f., ReaderView:PanningUpdate), a busy or unavailable worker means
 -- the hint is skipped entirely instead of falling back to the synchronous
 -- path: it must never abort an in-flight job nor block the main thread.
-function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
+function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only, use_bbox)
     logger.dbg("hinting page", pageno)
     local perf_t0 = PerfProfile.enabled and PerfProfile.now()
 
     local rect = nil
-    local page_size = self:getPageDimensions(pageno, zoom, rotation)
+    -- When the view crops this page to its content bbox (the zoom was chosen
+    -- to fill the screen with that area), the size that matters is the
+    -- *cropped* area: the native page at a cropped zoom spans several
+    -- screens, which would wrongly force excerpt-mode hints and clamp
+    -- hint_rect against the native page's origin instead of the cropped
+    -- area's — a rect the first paint after the turn can never request
+    -- (round 3.7).
+    local page_size
+    if use_bbox then
+        page_size = self:getUsedBBoxDimensions(pageno, zoom, rotation, true)
+    else
+        page_size = self:getPageDimensions(pageno, zoom, rotation)
+    end
     local needed_bytes = page_size.w * page_size.h * (self.render_color and 4 or 1) + 512
     local screen_area = CanvasContext:getWidth() * CanvasContext:getHeight()
     local reason
@@ -594,8 +613,11 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
             -- No view-provided rect: clip to the visible screen. Note that
             -- renderPage rects are in zoomed document pixels, which map 1:1
             -- to screen pixels (the page is rasterized at screen resolution).
+            -- Anchor at the page area's origin: for a cropped page that is
+            -- the bbox origin, the frame the first paint requests in.
             rect = Geom:new{
-                x = 0, y = 0,
+                x = page_size.x or 0,
+                y = page_size.y or 0,
                 w = math.min(page_size.w, CanvasContext:getWidth()),
                 h = math.min(page_size.h, CanvasContext:getHeight()),
             }

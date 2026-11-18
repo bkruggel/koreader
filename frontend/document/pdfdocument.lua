@@ -352,8 +352,8 @@ function PdfDocument:clipPagePNGString(pos0, pos1, pboxes, drawer)
     return self.koptinterface:clipPagePNGString(self, pos0, pos1, pboxes, drawer)
 end
 
-function PdfDocument:getPageBBox(pageno)
-    return self.koptinterface:getPageBBox(self, pageno)
+function PdfDocument:getPageBBox(pageno, defer_busy)
+    return self.koptinterface:getPageBBox(self, pageno, defer_busy)
 end
 
 function PdfDocument:getPageDimensions(pageno, zoom, rotation)
@@ -903,15 +903,11 @@ function PdfDocument:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, sa
         return "committed"
     end
 
-    -- Low-zoom unhinted renders without a rect are margin probes (auto-crop
-    -- / bbox inspection and the like): they are tiny, independent of the
-    -- user's next view, and must not cancel an active full-zoom viewport
-    -- job that the very next tap is about to consume. Let them render
-    -- alongside instead of aborting anything.
-    if not hinting and rect == nil and zoom < 0.5 then
-        return nil
-    end
-
+    -- (The old rect-less low-zoom "probe alongside" bypass is gone: letting
+    -- a synchronous render proceed here was the one main-thread page render
+    -- that could run while the worker is mid-job. Tiny auto-crop probes now
+    -- defer at their own site instead (c.f., KoptInterface:getAutoBBox), and
+    -- no caller reaches this path with rect == nil and hinting unset.)
     -- Obsolete job (different page or params): cancel it and render sync.
     self:_abortInFlightJob()
     return nil

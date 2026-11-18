@@ -14,15 +14,21 @@ local Input = Device.input
 local Screen = Device.screen
 local T = require("ffi/util").template
 
--- Auto-crop (trim_page ~= 3) must never crop down to a *degenerate* content
+-- Auto-crop (trim_page == 1) must never crop down to a *degenerate* content
 -- area. Sparse pages (title pages, part dividers, chapter openers) can probe
--- an ink bbox that is a thin strip of the page; cropping to it magnifies that
--- fragment to fill the screen, which users experience as "the page is
--- cropped" even though the setting is doing what it was told. Content must
--- cover at least this fraction of the page *area* before the view crops to
--- it; smaller bboxes fall back to fitting the whole page. Dense pages sit at
--- 60-90%, scanned books with wide margins at 25-50%, strips at <15%.
-local CROP_MIN_AREA_FRACTION = 0.2
+-- an ink bbox that is a thin band of the page — a full-width title banner on
+-- this device's test book spans ~88% of the width but ~11% of the height;
+-- cropping to it fills the screen with a fragment, which users experience as
+-- "the page is cropped" even though the setting is doing what it was told.
+-- The probed bbox must span at least this fraction of the page along BOTH
+-- axes before auto-crop may use it; smaller bands fall back to fitting the
+-- whole page. The check is per-axis, deliberately NOT an area check: a
+-- merely *partial* page (a chapter end, ~68% width × ~26% height) is
+-- legitimate content and must keep its crop — a 2D area threshold is what
+-- made the crop apply to some pages and not others ("crop setting not
+-- applied consistently"). Manual (trim_page == 0) and semi-auto (== 2) crop
+-- bounds are the user's own choices and are honored as-is.
+local CROP_MIN_AXIS_FRACTION = 0.15
 
 local ReaderZooming = InputContainer:extend{
     zoom = 1.0,
@@ -532,37 +538,36 @@ function ReaderZooming:onExitFlippingMode(zoom_mode)
     self.ui:handleEvent(Event:new("SetZoomMode", zoom_mode))
 end
 
-function ReaderZooming:getZoom(pageno)
-    -- check if we're in bbox mode and work on bbox if that's the case
+--- Pure zoom evaluation for `pageno`: computes the zoom the page renders at
+-- and whether its probed content bbox governs the view, WITHOUT touching
+-- ReaderView state.
+-- Hinting paths evaluate *upcoming* pages with this (ReaderPaging:
+-- getNextViewHint, ReaderHinting:onHintPage/getEntryEdgeRect, and
+-- ReaderHighlight's page-1 scale probe); writing the view-global use_bbox
+-- flag from those would make the *displayed* page's next recalculate mix
+-- its own zoom with a foreign page's crop decision — the "crop changes
+-- when revisited / when panning" bug (round 3.7).
+-- @return zoom, use_bbox (whether the page's content bbox governs the view)
+function ReaderZooming:getZoomForPage(pageno)
     local zoom
-    -- TEMP DIAGNOSTIC (round 3.5): device flips between cropped/uncropped
-    -- views across recalcs; log the decision inputs on every evaluation.
-    if PerfProfile.enabled then
-        PerfProfile.log("ZOOM_DECISION pageno=%d mode=%s trim=%s factor=%s",
-            pageno, tostring(self.zoom_mode),
-            tostring(self.ui.document.configurable.trim_page),
-            tostring(self.zoom_factor))
-    end
     local page_size = self.ui.document:getNativePageDimensions(pageno)
+    local use_bbox = false
     if not (self.zoom_mode and self.zoom_mode:match("^page") or self.ui.document.configurable.trim_page == 3) then
-        local ubbox_dimen = self.ui.document:getUsedBBoxDimensions(pageno, 1)
+        local ubbox_dimen = self.ui.document:getUsedBBoxDimensions(pageno, 1, nil, true)
         -- if bbox is larger than the native page dimension render the full page
         -- See discussion in koreader/koreader#970.
         if ubbox_dimen.w <= page_size.w and ubbox_dimen.h <= page_size.h
-            -- ...and, in the probe-driven modes, if it is a meaningful part
-            -- of the page (c.f. CROP_MIN_AREA_FRACTION above: the strip a
-            -- sparse page probes must not be magnified to fill the screen).
-            -- Manual mode (trim_page == 0) honors user-drawn boxes as-is.
-            and (self.ui.document.configurable.trim_page == 0
-                or ubbox_dimen.w * ubbox_dimen.h >= page_size.w * page_size.h * CROP_MIN_AREA_FRACTION) then
+            -- ...and, in the auto-detection mode, if it is a meaningful part
+            -- of the page along both axes (c.f. CROP_MIN_AXIS_FRACTION
+            -- above: the band a sparse page probes must not fill the
+            -- screen, but a partial page must not lose its crop either).
+            -- Manual (0) and semi-auto (2) bounds are the user's own.
+            and (self.ui.document.configurable.trim_page ~= 1
+                or (ubbox_dimen.w >= page_size.w * CROP_MIN_AXIS_FRACTION
+                    and ubbox_dimen.h >= page_size.h * CROP_MIN_AXIS_FRACTION)) then
             page_size = ubbox_dimen
-            self.view:onBBoxUpdate(ubbox_dimen)
-        else
-            self.view:onBBoxUpdate(nil)
+            use_bbox = true
         end
-    else
-        -- otherwise, operate on full page
-        self.view:onBBoxUpdate(nil)
     end
     -- calculate zoom value:
     local zoom_w = self.dimen.w
@@ -613,8 +618,33 @@ function ReaderZooming:getZoom(pageno)
             end
             logger.dbg("new zoom: "..zoom)
 
-            if zoom < 0 then return 0 end
+            if zoom < 0 then return 0, false, zoom_w, zoom_h end
         end
+    end
+    return zoom, use_bbox, zoom_w, zoom_h
+end
+
+--- The zoom the given page renders at. Applies the page's crop decision to
+-- the view — but ONLY when evaluating the page actually being displayed:
+-- hinting paths run this for upcoming pages constantly (every turn, and
+-- after every intra-page pan via the opportunistic hint cycle), and a use_bbox
+-- flip from one of those would corrupt the next recalculate of the *current*
+-- view (its zoom combined with a foreign page's crop decision). Callers that
+-- evaluate a foreign page (or want the decision without view side effects)
+-- use getZoomForPage directly.
+function ReaderZooming:getZoom(pageno)
+    -- TEMP DIAGNOSTIC (round 3.5): device flips between cropped/uncropped
+    -- views across recalcs; log the decision inputs on every evaluation.
+    if PerfProfile.enabled then
+        PerfProfile.log("ZOOM_DECISION pageno=%d mode=%s trim=%s factor=%s state_page=%s",
+            pageno, tostring(self.zoom_mode),
+            tostring(self.ui.document.configurable.trim_page),
+            tostring(self.zoom_factor),
+            tostring(self.view.state.page))
+    end
+    local zoom, use_bbox, zoom_w, zoom_h = self:getZoomForPage(pageno)
+    if self.view.state.page == nil or pageno == self.view.state.page then
+        self.view:onBBoxUpdate(use_bbox and true or false)
     end
     return zoom, zoom_w, zoom_h
 end

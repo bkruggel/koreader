@@ -1260,8 +1260,11 @@ function ReaderPaging:getNextViewHint()
     if target_page < 1 or target_page > self.number_of_pages then
         return nil -- end of book: nothing meaningful to hint
     end
-    local zoom = self.ui.zooming:getZoom(target_page)
-    local target_pa = self.view:getPageArea(target_page, zoom, self.view.state.rotation)
+    -- Evaluate the target page purely (no view-state side effects) and with
+    -- its OWN crop decision: getPageArea's global use_bbox flag tracks the
+    -- currently displayed page, which may crop differently than the target.
+    local zoom, target_use_bbox = self.ui.zooming:getZoomForPage(target_page)
+    local target_pa = self.view:getPageArea(target_page, zoom, self.view.state.rotation, target_use_bbox)
     -- The viewport _gotoPage lands on, exactly as ReaderView:recalculate
     -- anchors it: viewport-sized (footer-aware), at the right edge for RTL,
     -- at the bottom when configurable.zoom_direction is 2-5, then clamped
@@ -1275,6 +1278,18 @@ function ReaderPaging:getNextViewHint()
     if self.view.footer_visible and self.view.footer
             and not self.view.footer.settings.reclaim_height then
         fresh.h = fresh.h - self.view.footer:getHeight()
+    end
+    -- A cropped page may be smaller than the viewport on either axis: clamp
+    -- the entry viewport to the page area, exactly like ReaderHinting:
+    -- getEntryEdgeRect does — offsetWithin below only shifts the origin, so
+    -- an unclamped size would make the predicted rect differ from what
+    -- ReaderView:recalculate requests after the turn (guaranteed
+    -- EXCERPT_MISS, i.e., a cold paint on every turn to such a page).
+    if fresh.w > target_pa.w then
+        fresh.w = target_pa.w
+    end
+    if fresh.h > target_pa.h then
+        fresh.h = target_pa.h
     end
     if (self.ui.document.configurable.writing_direction or 0) > 0 then
         fresh.x = target_pa.x + target_pa.w - fresh.w
@@ -1296,7 +1311,7 @@ function ReaderPaging:getNextViewHint()
     goto_entry_end(x, -x_diff)
     goto_entry_end(y, -y_diff)
     entry:offsetWithin(target_pa, 0, 0)
-    return { page = target_page, rect = entry }
+    return { page = target_page, rect = entry, use_bbox = target_use_bbox }
 end
 
 function ReaderPaging:onRedrawCurrentPage()

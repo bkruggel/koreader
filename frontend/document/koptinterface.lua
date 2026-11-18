@@ -191,13 +191,13 @@ function KoptInterface:getContextHash(doc, pageno, bbox, hash_list)
     table.insert(hash_list, canvas_size.h)
 end
 
-function KoptInterface:getPageBBox(doc, pageno)
+function KoptInterface:getPageBBox(doc, pageno, defer_busy)
     if doc.configurable.text_wrap ~= 1 and doc.configurable.trim_page == 1 then
         -- auto bbox finding
-        return self:getAutoBBox(doc, pageno)
+        return self:getAutoBBox(doc, pageno, defer_busy)
     elseif doc.configurable.text_wrap ~= 1 and doc.configurable.trim_page == 2 then
         -- semi-auto bbox finding
-        return self:getSemiAutoBBox(doc, pageno)
+        return self:getSemiAutoBBox(doc, pageno, defer_busy)
     else
         -- get saved manual bbox
         return Document.getPageBBox(doc, pageno)
@@ -207,7 +207,7 @@ end
 --[[--
 Auto detect bbox.
 --]]
-function KoptInterface:getAutoBBox(doc, pageno)
+function KoptInterface:getAutoBBox(doc, pageno, defer_busy)
     local native_size = Document.getNativePageDimensions(doc, pageno)
     local bbox = {
         x0 = 0,
@@ -220,6 +220,21 @@ function KoptInterface:getAutoBBox(doc, pageno)
     local hash = table.concat(hash_list, "|")
     local cached = DocCache:check(hash)
     if not cached then
+        -- The probe below renders the page on the main thread (openPage +
+        -- getPagePix). While the background rasterization worker is running
+        -- a job, that is two page-consuming MuPDF operations in flight at
+        -- once — a race we must not enter. Deferring costs little here: the
+        -- caller falls back to the stored/full-page bbox for this
+        -- evaluation, nothing is cached, and the next zoom evaluation of
+        -- this page retries (the worker is idle by then in the common case,
+        -- since hint jobs are aborted/coalesced around user interactions).
+        if defer_busy then
+            local pdf = require("ffi/mupdf")
+            if pdf.workerStatus() == pdf.WORKER_RUNNING then
+                PerfProfile.log("BBOX_PROBE_DEFERRED page=%d", pageno)
+                return Document.getPageBBox(doc, pageno)
+            end
+        end
         local perf_t0 = PerfProfile.enabled and PerfProfile.now()
         local page = doc._document:openPage(pageno)
         local kc = self:createContext(doc, pageno, bbox)
@@ -251,7 +266,7 @@ end
 --[[--
 Detect bbox within user restricted bbox.
 --]]
-function KoptInterface:getSemiAutoBBox(doc, pageno)
+function KoptInterface:getSemiAutoBBox(doc, pageno, defer_busy)
     -- use manual bbox
     local bbox = Document.getPageBBox(doc, pageno)
     local hash_list = { "semiautobbox" }
@@ -259,6 +274,15 @@ function KoptInterface:getSemiAutoBBox(doc, pageno)
     local hash = table.concat(hash_list, "|")
     local cached = DocCache:check(hash)
     if not cached then
+        -- Same worker-race deferral as getAutoBBox above; the user's
+        -- restricted bbox is the fallback until the probe can run.
+        if defer_busy then
+            local pdf = require("ffi/mupdf")
+            if pdf.workerStatus() == pdf.WORKER_RUNNING then
+                PerfProfile.log("SEMIAUTO_PROBE_DEFERRED page=%d", pageno)
+                return bbox
+            end
+        end
         local page = doc._document:openPage(pageno)
         local kc = self:createContext(doc, pageno, bbox)
         local auto_bbox = {}

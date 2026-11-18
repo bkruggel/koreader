@@ -32,6 +32,10 @@
         shot        1 = write a PNG of the screen after every turn/tap
                     (shotdir defaults to $KO_HOME/screenshots)
         shotdir     explicit directory for PNGs
+        panflow     1 = drive interactions through GotoViewRel (the touch
+                    path: pans within the page, wraps at the edge) instead
+                    of GotoPageRel — exercises the pan → opportunistic-hint
+                    cycle on zoomed/cropped pages
 --]]
 --]]
 
@@ -236,7 +240,14 @@ function BenchmarkDriver:run()
         end
 
         PerfProfile.log("TURN_START seq=%d dir=%d", self._seq, dir)
-        if cfg.zoommode == "columns" and cfg.respectdoc ~= 1 then
+        if cfg.panflow == 1 then
+            -- The touch path (onGotoViewRel): pans within the page when the
+            -- cropped page area exceeds the viewport, wraps to the next
+            -- page at the edge. This is what exercises the pan →
+            -- opportunistic-hint cycle that a whole-page-fit turn sequence
+            -- never reaches.
+            self.ui:handleEvent(Event:new("GotoViewRel", dir))
+        elseif cfg.zoommode == "columns" and cfg.respectdoc ~= 1 then
             -- Column navigation follows the tap path (onGotoViewRel): each
             -- step pans within the column, wraps to the next column at the
             -- bottom, or turns the page after the last column.
