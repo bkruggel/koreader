@@ -8,10 +8,21 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local SpinWidget = require("ui/widget/spinwidget")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
+local PerfProfile = require("perfprofile")
 local _ = require("gettext")
 local Input = Device.input
 local Screen = Device.screen
 local T = require("ffi/util").template
+
+-- Auto-crop (trim_page ~= 3) must never crop down to a *degenerate* content
+-- area. Sparse pages (title pages, part dividers, chapter openers) can probe
+-- an ink bbox that is a thin strip of the page; cropping to it magnifies that
+-- fragment to fill the screen, which users experience as "the page is
+-- cropped" even though the setting is doing what it was told. Content must
+-- cover at least this fraction of the page *area* before the view crops to
+-- it; smaller bboxes fall back to fitting the whole page. Dense pages sit at
+-- 60-90%, scanned books with wide margins at 25-50%, strips at <15%.
+local CROP_MIN_AREA_FRACTION = 0.2
 
 local ReaderZooming = InputContainer:extend{
     zoom = 1.0,
@@ -524,12 +535,26 @@ end
 function ReaderZooming:getZoom(pageno)
     -- check if we're in bbox mode and work on bbox if that's the case
     local zoom
+    -- TEMP DIAGNOSTIC (round 3.5): device flips between cropped/uncropped
+    -- views across recalcs; log the decision inputs on every evaluation.
+    if PerfProfile.enabled then
+        PerfProfile.log("ZOOM_DECISION pageno=%d mode=%s trim=%s factor=%s",
+            pageno, tostring(self.zoom_mode),
+            tostring(self.ui.document.configurable.trim_page),
+            tostring(self.zoom_factor))
+    end
     local page_size = self.ui.document:getNativePageDimensions(pageno)
     if not (self.zoom_mode and self.zoom_mode:match("^page") or self.ui.document.configurable.trim_page == 3) then
         local ubbox_dimen = self.ui.document:getUsedBBoxDimensions(pageno, 1)
         -- if bbox is larger than the native page dimension render the full page
         -- See discussion in koreader/koreader#970.
-        if ubbox_dimen.w <= page_size.w and ubbox_dimen.h <= page_size.h then
+        if ubbox_dimen.w <= page_size.w and ubbox_dimen.h <= page_size.h
+            -- ...and, in the probe-driven modes, if it is a meaningful part
+            -- of the page (c.f. CROP_MIN_AREA_FRACTION above: the strip a
+            -- sparse page probes must not be magnified to fill the screen).
+            -- Manual mode (trim_page == 0) honors user-drawn boxes as-is.
+            and (self.ui.document.configurable.trim_page == 0
+                or ubbox_dimen.w * ubbox_dimen.h >= page_size.w * page_size.h * CROP_MIN_AREA_FRACTION) then
             page_size = ubbox_dimen
             self.view:onBBoxUpdate(ubbox_dimen)
         else

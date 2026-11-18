@@ -9,6 +9,7 @@ local Math = require("optmath")
 local TileCacheItem = require("document/tilecacheitem")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local PerfProfile = require("perfprofile")
 
 --[[
 This is an abstract interface to a document
@@ -384,10 +385,16 @@ end
 
 function Document:setTileCacheValidity(ts)
     self.tile_cache_validity_ts = ts
+    -- Restored validity may make already-committed tiles stale: allow the
+    -- async path to re-dispatch them (c.f., PdfDocument:hintPageAsync).
+    self._last_committed_hash = nil
 end
 
 function Document:resetTileCacheValidity()
     self.tile_cache_validity_ts = os.time()
+    -- Page content changed (highlights, etc.): cached tiles are stale, so
+    -- don't suppress re-hinting of an identical target.
+    self._last_committed_hash = nil
 end
 
 function Document:getFullPageHash(pageno, zoom, rotation, gamma, saturation)
@@ -411,6 +418,19 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
     -- If rect contains a nested scaled_rect object, our caller handled scaling itself (e.g., drawPagePart)
     local is_prescaled = rect and rect.scaled_rect ~= nil or false
 
+    -- Phase 4: before doing any synchronous work, resolve against a possibly
+    -- in-flight background hint (commit it, or skip work it already covers).
+    -- Prescaled fragment requests never match a hint, and aborting the job
+    -- for them would be counter-productive, so they bypass this entirely.
+    if not is_prescaled and self.resolveInFlightHint then
+        local resolved = self:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, saturation, hinting)
+        if resolved == "covered" then
+            return
+        end
+        -- "committed" falls through: the job's tile is now in the cache and
+        -- the lookups below will hit it.
+    end
+
     local hash, hash_excerpt, tile
     if is_prescaled then
         hash = self:getPagePartHash(pageno, zoom, rotation, gamma, saturation, rect)
@@ -425,6 +445,9 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
         if not tile and rect then
             hash_excerpt = hash.."|"..tostring(rect)
             tile = DocCache:check(hash_excerpt)
+            if not tile then
+                PerfProfile.log("EXCERPT_MISS page=%d rect=%s hash=%s", pageno, tostring(rect), hash_excerpt)
+            end
         end
     end
     if tile then
@@ -459,6 +482,9 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
             --- @todo figure out how to better segment the page
             if not rect then
                 logger.warn("No render region was specified, we won't render the page at all!")
+                PerfProfile.log("CACHE_REJECT page=%d size=%dx%d bytes=%d",
+                    pageno, size.w, size.h,
+                    size.w * size.h * (self.render_color and 4 or 1) + 512)
                 -- no rect specified, abort
                 if hinting then
                     CanvasContext:enableCPUCores(1)
@@ -524,9 +550,82 @@ end
 
 -- a hint for the cache engine to paint a full page to the cache
 --- @todo this should trigger a background operation
-function Document:hintPage(pageno, zoom, rotation, gamma, saturation)
+-- Phase 2/4: full-page hints that DocCache would silently reject are clipped
+-- to the viewport instead (the caller may pass the view's visible_area as
+-- hint_rect so the excerpt matches the next paint exactly), as are hints for
+-- zoomed pages much larger than the screen (multi-step panned views, e.g.
+-- 2-column zooms: only a viewport excerpt is painted per interaction, so
+-- rasterizing all quadrants in the worker would just stall the next tap),
+-- and whenever the document backend supports it the hint is dispatched to
+-- the background worker, keeping the main thread free either way.
+-- When dispatch_only is set (opportunistic re-hints fired outside the paint
+-- cycle, c.f., ReaderView:PanningUpdate), a busy or unavailable worker means
+-- the hint is skipped entirely instead of falling back to the synchronous
+-- path: it must never abort an in-flight job nor block the main thread.
+function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
     logger.dbg("hinting page", pageno)
-    self:renderPage(pageno, nil, zoom, rotation, gamma, saturation, true)
+    local perf_t0 = PerfProfile.enabled and PerfProfile.now()
+
+    local rect = nil
+    local page_size = self:getPageDimensions(pageno, zoom, rotation)
+    local needed_bytes = page_size.w * page_size.h * (self.render_color and 4 or 1) + 512
+    local screen_area = CanvasContext:getWidth() * CanvasContext:getHeight()
+    local reason
+    if not DocCache:willAccept(needed_bytes) then
+        -- Rendering the full page would only block the main thread and then
+        -- have its result thrown away by DocCache. Hint the viewport instead.
+        reason = "cache"
+    elseif page_size.w * page_size.h > 1.5 * screen_area then
+        -- The full page fits the cache but spans several screens at this
+        -- zoom: the next interaction still paints a single viewport, and a
+        -- full-page worker job would keep the worker (and any coalescing
+        -- wait) busy for all of them.
+        reason = "zoom"
+    end
+    if reason then
+        if hint_rect then
+            rect = Geom:new{
+                x = math.min(hint_rect.x or 0, page_size.w),
+                y = math.min(hint_rect.y or 0, page_size.h),
+                w = math.min(hint_rect.w, page_size.w - (hint_rect.x or 0)),
+                h = math.min(hint_rect.h, page_size.h - (hint_rect.y or 0)),
+            }
+        else
+            -- No view-provided rect: clip to the visible screen. Note that
+            -- renderPage rects are in zoomed document pixels, which map 1:1
+            -- to screen pixels (the page is rasterized at screen resolution).
+            rect = Geom:new{
+                x = 0, y = 0,
+                w = math.min(page_size.w, CanvasContext:getWidth()),
+                h = math.min(page_size.h, CanvasContext:getHeight()),
+            }
+        end
+        PerfProfile.log("HINT_VIEWPORT page=%d full=%dx%d rect=%d,%d,%dx%d reason=%s",
+            pageno, page_size.w, page_size.h, rect.x, rect.y, rect.w, rect.h, reason)
+    end
+
+    -- Phase 4: prefer the background worker (dispatch is a few ms of display
+    -- list building; rasterization happens off-thread). Fall back to the
+    -- synchronous path when this backend has no async support or the worker
+    -- is already busy; renderPage's resolve hook then coalesces with the
+    -- in-flight job instead of duplicating it. (Backends with async support
+    -- handle dispatch_only internally by parking the hint while busy.)
+    if self.hintPageAsync and self:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturation, dispatch_only) then
+        if perf_t0 then
+            PerfProfile.log("HINT_DISPATCH_MS page=%d duration=%.2f", pageno, PerfProfile.now() - perf_t0)
+        end
+        return
+    end
+
+    if dispatch_only then
+        PerfProfile.log("HINT_SKIP_BUSY page=%d", pageno)
+        return
+    end
+
+    self:renderPage(pageno, rect, zoom, rotation, gamma, saturation, true)
+    if perf_t0 then
+        PerfProfile.log("HINT_BLOCK_MS page=%d duration=%.2f", pageno, PerfProfile.now() - perf_t0)
+    end
 end
 
 --[[
@@ -538,7 +637,28 @@ Draw page content to blitbuffer.
 @rect: visible_area inside document page
 --]]
 function Document:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, saturation)
+    -- The caller is painting this view right now: remember it as the
+    -- *active view*, the reference the async engine uses to tell whether an
+    -- in-flight job is still worth running (c.f., PdfDocument:_jobStillRelevant).
+    -- A paint also supersedes any opportunistic hint parked for an older
+    -- state: whatever it predicted is stale the moment this view is shown.
+    self._active_view = {
+        pageno = pageno, rect = rect, zoom = zoom,
+        rotation = rotation, gamma = gamma, saturation = saturation,
+    }
+    if self._pending_hint then
+        PerfProfile.log("PENDING_HINT_SUPERSEDED page=%d paint=%d",
+            self._pending_hint.pageno, pageno)
+        self._pending_hint = nil
+    end
     local tile = self:renderPage(pageno, rect, zoom, rotation, gamma, saturation)
+    -- TEMP DIAGNOSTIC (round 3.6): pin down the served tile's excerpt vs the
+    -- requested rect on ink-offset pages (right-edge cut investigation).
+    if PerfProfile.enabled then
+        PerfProfile.log("DRAW_TILE page=%d rect=%s excerpt=%s bb=%dx%d",
+            pageno, tostring(rect), tostring(tile and tile.excerpt),
+            tile and tile.bb.w or -1, tile and tile.bb.h or -1)
+    end
     -- Enable SW dithering if requested (only available in koptoptions)
     if self.sw_dithering then
         target:ditherblitFrom(tile.bb,

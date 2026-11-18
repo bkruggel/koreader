@@ -573,6 +573,12 @@ function ReaderPaging:onGotoPercent(percent)
 end
 
 function ReaderPaging:onGotoViewRel(diff, no_page_turn)
+    -- Remember the direction of the last relative view change: hinting uses
+    -- it as the "active reading direction" to predict what the next
+    -- interaction will display (c.f., ReaderPaging:getNextViewHint).
+    if diff ~= 0 then
+        self.last_view_rel_diff = diff > 0 and 1 or -1
+    end
     -- When called via a key event, the second arg is a key object (table), not used here.
     no_page_turn = no_page_turn == true and true or nil
     -- ReaderSearch calls with no_page_turn = true.
@@ -1126,6 +1132,173 @@ function ReaderPaging:onGotoPageRel(diff, no_page_turn)
     return true
 end
 
+--- Predict, read-only, what the next relative view change in the active
+-- reading direction would display, so background hinting can render exactly
+-- what the next paint will request. This mirrors the decision tree of
+-- onGotoPageRel (pan within the page, pan to the line end, next line/column,
+-- or turn) *including* its direction adjustments — the axis inversion for
+-- zoom_direction_vertical (2D column navigation through multi-column pages),
+-- right-to-left and bottom-to-top flows — without applying any of it.
+-- @return {page, rect} for the next view, or nil when it cannot be
+-- predicted (scroll mode or free zoom: those keep the legacy hinting
+-- behavior).
+function ReaderPaging:getNextViewHint()
+    if self.view.page_scroll then
+        return nil
+    end
+    if self.zoom_mode == "free" then
+        return nil
+    end
+    local va = self.visible_area
+    local pa = self.page_area
+    if not va or not pa or pa.w == 0 or pa.h == 0 then
+        return nil
+    end
+    local diff = self.last_view_rel_diff or 1
+
+    -- Direction adjustments, verbatim from onGotoPageRel: the state machine
+    -- below is generic over the (possibly swapped) axis variables, so
+    -- running the identical block keeps the prediction faithful for every
+    -- reading direction. With zoom_direction_vertical, "line" means column:
+    -- intra-column steps pan vertically, the wrap moves one column across
+    -- and back to the top, and a page turn resets both axes.
+    local right_to_left = self.ui.document.configurable.writing_direction
+        and self.ui.document.configurable.writing_direction > 0
+    local bottom_to_top = self.ui.zooming.zoom_bottom_to_top
+    local h_progress = 1 - self.ui.zooming.zoom_overlap_h * (1/100)
+    local v_progress = 1 - self.ui.zooming.zoom_overlap_v * (1/100)
+    local x, y, w, h = "x", "y", "w", "h"
+    local x_diff = diff
+    local y_diff = diff
+
+    if self.ui.zooming.zoom_direction_vertical then  -- invert axes
+        y, x, h, w = x, y, w, h
+        h_progress, v_progress = v_progress, h_progress
+        if right_to_left then
+            x_diff, y_diff = -x_diff, -y_diff
+        end
+        if bottom_to_top then
+            x_diff = -x_diff
+        end
+    elseif bottom_to_top then
+        y_diff = -y_diff
+    end
+    if right_to_left then
+        x_diff = -x_diff
+    end
+
+    local x_pan_off = Math.roundAwayFromZero(va[w] * h_progress * x_diff)
+    local y_pan_off = Math.roundAwayFromZero(va[h] * v_progress * y_diff)
+
+    local new_va = { x = va.x, y = va.y, w = va.w, h = va.h }
+    local function at_end(axis)
+        -- returns true if we're at the end of the line/column (axis = x)
+        -- or page (axis = y)
+        local len, _diff
+        if axis == x then
+            len, _diff = w, x_diff
+        else
+            len, _diff = h, y_diff
+        end
+        return va[axis] + va[len] + _diff > pa[axis] + pa[len]
+            or va[axis] + _diff < pa[axis]
+    end
+    local function goto_end(axis, _diff)
+        local len = axis == x and w or h
+        _diff = _diff or (axis == x and x_diff or y_diff)
+        new_va[axis] = _diff > 0
+                    and va[axis] + pa[len] - va[len]
+                    or pa[axis]
+    end
+    -- The applied pan goes through ReaderView:PanningUpdate, which offsets
+    -- the view and clamps it back inside the page; replicate that clamp so
+    -- the predicted rect matches what the paint will request.
+    local function panned_rect()
+        local rect = Geom:new(new_va)
+        rect:offsetWithin(pa, 0, 0)
+        return rect
+    end
+
+    -- Move the view area towards line/column end, then handle page boundary
+    -- cases exactly like onGotoPageRel does.
+    new_va[x] = va[x] + x_pan_off
+    if pa:contains(new_va) then
+        return { page = self.current_page, rect = panned_rect() }
+    end
+    if not at_end(x) then
+        goto_end(x)
+        return { page = self.current_page, rect = panned_rect() }
+    end
+    -- goto_next_line(): wrap to the start edge of the x axis and one
+    -- viewport step along the y axis (next line, or next column when the
+    -- axes are inverted for column navigation).
+    new_va[y] = va[y] + y_pan_off
+    goto_end(x, -x_diff)
+    if pa:contains(new_va) then
+        return { page = self.current_page, rect = panned_rect() }
+    end
+    if not at_end(y) then
+        goto_end(y)
+        return { page = self.current_page, rect = panned_rect() }
+    end
+
+    -- The next interaction turns the page: the target page is entered with
+    -- *both* axes reset (goto_end(y, -y_diff) and goto_end(x, -x_diff) after
+    -- the _gotoPage in goto_next_page) to its entry corner — top-left for
+    -- forward turns, bottom-right for backward ones, per reading direction —
+    -- instead of carrying over any pan offset from the current column.
+    local target_page
+    if self.ui.document:hasHiddenFlows() then
+        target_page = diff > 0 and self.ui.document:getNextPage(self.current_page)
+            or self.ui.document:getPrevPage(self.current_page)
+        if target_page == 0 then
+            return nil
+        end
+    else
+        target_page = self.current_page + diff
+    end
+    if target_page < 1 or target_page > self.number_of_pages then
+        return nil -- end of book: nothing meaningful to hint
+    end
+    local zoom = self.ui.zooming:getZoom(target_page)
+    local target_pa = self.view:getPageArea(target_page, zoom, self.view.state.rotation)
+    -- The viewport _gotoPage lands on, exactly as ReaderView:recalculate
+    -- anchors it: viewport-sized (footer-aware), at the right edge for RTL,
+    -- at the bottom when configurable.zoom_direction is 2-5, then clamped
+    -- inside the page.
+    local fresh = Geom:new{
+        x = target_pa.x,
+        y = target_pa.y,
+        w = self.view.dimen.w,
+        h = self.view.dimen.h,
+    }
+    if self.view.footer_visible and self.view.footer
+            and not self.view.footer.settings.reclaim_height then
+        fresh.h = fresh.h - self.view.footer:getHeight()
+    end
+    if (self.ui.document.configurable.writing_direction or 0) > 0 then
+        fresh.x = target_pa.x + target_pa.w - fresh.w
+    end
+    local zoom_direction = self.ui.document.configurable.zoom_direction or 0
+    if zoom_direction >= 2 and zoom_direction <= 5 then
+        fresh.y = target_pa.y + target_pa.h - fresh.h
+    end
+    fresh:offsetWithin(target_pa, 0, 0)
+    -- goto_end(x, -x_diff) and goto_end(y, -y_diff) on the target page,
+    -- then the same PanningUpdate clamp.
+    local entry = fresh:copy()
+    local function goto_entry_end(axis, _diff)
+        local len = axis == x and w or h
+        entry[axis] = _diff > 0
+            and fresh[axis] + target_pa[len] - fresh[len]
+            or target_pa[axis]
+    end
+    goto_entry_end(x, -x_diff)
+    goto_entry_end(y, -y_diff)
+    entry:offsetWithin(target_pa, 0, 0)
+    return { page = target_page, rect = entry }
+end
+
 function ReaderPaging:onRedrawCurrentPage()
     self.ui:handleEvent(Event:new("PageUpdate", self.current_page))
     return true
@@ -1152,6 +1325,9 @@ function ReaderPaging:_gotoPage(number, orig_mode)
 end
 
 function ReaderPaging:onGotoPage(number, pos)
+    -- Absolute jumps (TOC, bookmarks, links...) enter the page at its top:
+    -- reset the assumed reading direction accordingly.
+    self.last_view_rel_diff = 1
     self:setPagePosition(number, 0)
     self:_gotoPage(number)
     if pos then

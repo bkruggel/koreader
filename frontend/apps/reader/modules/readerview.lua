@@ -19,6 +19,7 @@ local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local dbg = require("dbg")
 local logger = require("logger")
+local PerfProfile = require("perfprofile")
 local optionsutil = require("ui/data/optionsutil")
 local Size = require("ui/size")
 local time = require("ui/time")
@@ -117,6 +118,13 @@ function ReaderView:init()
     self:addWidgets()
     self.emitHintPageEvent = function()
         self.ui:handleEvent(Event:new("HintPage", self.hinting))
+    end
+    -- Opportunistic variant fired right after an intra-page pan update (see
+    -- PanningUpdate): dispatches a hint for the next view without ever
+    -- falling back to a synchronous render (the paint that follows this pan
+    -- remains the authoritative hinting point).
+    self.emitOpportunisticHintEvent = function()
+        self.ui:handleEvent(Event:new("HintPage", self.hinting, true))
     end
 
     -- We've subclassed OverlapGroup, go through its init, because it does some funky stuff with self.dimen...
@@ -378,6 +386,7 @@ end
 function ReaderView:drawScrollPages(bb, x, y)
     local pos = Geom:new{x = x , y = y}
     for page, state in ipairs(self.page_states) do
+        local perf_t0 = PerfProfile.enabled and PerfProfile.now()
         self.document:drawPage(
             bb,
             pos.x + state.offset.x,
@@ -388,6 +397,9 @@ function ReaderView:drawScrollPages(bb, x, y)
             state.rotation,
             state.gamma,
             state.saturation)
+        if perf_t0 then
+            PerfProfile.log("PAINT_PAGE_MS page=%d duration=%.2f", state.page, PerfProfile.now() - perf_t0)
+        end
         pos.y = pos.y + state.visible_area.h
         -- draw page gap if not the last part
         if page ~= #self.page_states then
@@ -453,6 +465,7 @@ function ReaderView:drawPageGap(bb, x, y)
 end
 
 function ReaderView:drawSinglePage(bb, x, y)
+    local perf_t0 = PerfProfile.enabled and PerfProfile.now()
     self.document:drawPage(
         bb,
         x + self.state.offset.x,
@@ -463,6 +476,9 @@ function ReaderView:drawSinglePage(bb, x, y)
         self.state.rotation,
         self.state.gamma,
         self.state.saturation)
+    if perf_t0 then
+        PerfProfile.log("PAINT_PAGE_MS page=%d duration=%.2f", self.state.page, PerfProfile.now() - perf_t0)
+    end
     UIManager:nextTick(self.emitHintPageEvent)
 end
 
@@ -766,6 +782,14 @@ function ReaderView:recalculate()
             self.state.page,
             self.state.zoom,
             self.state.rotation)
+        -- TEMP DIAGNOSTIC (round 3.5): device "cropped view after turn"
+        -- report; log the geometry the view actually anchors to.
+        if PerfProfile.enabled then
+            PerfProfile.log("VIEW_GEOM page=%d zoom=%.3f use_bbox=%s page_area=%.0fx%.0f+%d+%d visible=%.0fx%.0f+%d+%d",
+                self.state.page, self.state.zoom, tostring(self.use_bbox),
+                self.page_area.w, self.page_area.h, self.page_area.x, self.page_area.y,
+                self.visible_area.w, self.visible_area.h, self.visible_area.x, self.visible_area.y)
+        end
         -- reset our size
         self.visible_area:setSizeTo(self.dimen)
         if self.footer_visible and not self.footer.settings.reclaim_height then
@@ -823,6 +847,14 @@ function ReaderView:PanningUpdate(dx, dy)
     if self.visible_area ~= old then
         -- flag a repaint
         UIManager:setDirty(self.dialog, "partial")
+        -- Re-hint after every intra-page pan: zoomed multi-segment views
+        -- (e.g. 2-column navigation) take several pans per page, and each
+        -- upcoming segment must be pre-rendered while the current one is
+        -- read. The dispatch is opportunistic (no synchronous fallback), so
+        -- it can't disturb an in-flight job; if the worker is busy, the
+        -- paint-anchored hint event for this same pan will handle it once
+        -- the repaint has settled.
+        UIManager:nextTick(self.emitOpportunisticHintEvent)
         logger.dbg("on pan: page_area", self.page_area)
         logger.dbg("on pan: visible_area", self.visible_area)
         self.ui:handleEvent(
@@ -1266,9 +1298,11 @@ end
 function ReaderView:onCloseWidget()
     -- Stop any pending HintPage event
     UIManager:unschedule(self.emitHintPageEvent)
+    UIManager:unschedule(self.emitOpportunisticHintEvent)
     --- @fixme: The awful readerhighlight_spec test *relies* on this pointer being left dangling...
     if not self.ui._testsuite then
         self.emitHintPageEvent = nil
+        self.emitOpportunisticHintEvent = nil
     end
 end
 

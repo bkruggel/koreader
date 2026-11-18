@@ -1,3 +1,4 @@
+local Blitbuffer = require("ffi/blitbuffer")
 local CacheItem = require("cacheitem")
 local CanvasContext = require("document/canvascontext")
 local DocCache = require("document/doccache")
@@ -5,6 +6,9 @@ local DocSettings = require("docsettings")
 local Document = require("document/document")
 local DrawContext = require("ffi/drawcontext")
 local logger = require("logger")
+local PerfProfile = require("perfprofile")
+local TileCacheItem = require("document/tilecacheitem")
+local UIManager = require("ui/uimanager")
 local util = require("util")
 local ffi = require("ffi")
 local C = ffi.C
@@ -23,6 +27,16 @@ function PdfDocument:init()
     if not pdf then pdf = require("ffi/mupdf") end
     self.koptinterface = require("document/koptinterface")
     self.koptinterface:setDefaultConfigurable(self.configurable)
+    -- Async rendering engine state (see hintPageAsync below)
+    self._zombie_jobs = {}
+    self._worker_broken = false
+    self._worker_initialized = false
+    -- 2-slot LRU of per-page display lists (see _getDisplayList): one zoomed
+    -- page is hinted once per viewport slice (4-6 times in 2-column
+    -- navigation), and rebuilding its display list every time re-parses the
+    -- content stream (and re-loads embedded image objects) on the main
+    -- thread — the source of the column-wrap stalls on image-heavy pages.
+    self._display_list_slots = { {}, {} }
     local ok
     ok, self._document = pcall(pdf.openDocument, self.file)
     if not ok then
@@ -259,6 +273,7 @@ function PdfDocument:saveHighlight(pageno, item, annot_color)
     item.pboxes = _quadpointsToPboxes(quadpoints, n)
     page:close()
     self:resetTileCacheValidity()
+    self:_purgeDisplayListCache()
 end
 
 function PdfDocument:deleteHighlight(pageno, item)
@@ -268,12 +283,13 @@ function PdfDocument:deleteHighlight(pageno, item)
     self.is_edited = true
     local quadpoints, n = _quadpointsFromPboxes(item.pboxes)
     local page = self._document:openPage(pageno)
-    local annot = page:getMarkupAnnotation(quadpoints, n)
-    if annot ~= nil then
-        page:deleteAnnotation(annot)
-        self:resetTileCacheValidity()
-    end
-    page:close()
+        local annot = page:getMarkupAnnotation(quadpoints, n)
+        if annot ~= nil then
+            page:deleteAnnotation(annot)
+            self:resetTileCacheValidity()
+            self:_purgeDisplayListCache()
+        end
+        page:close()
 end
 
 function PdfDocument:updateHighlightContents(pageno, item, contents)
@@ -287,6 +303,7 @@ function PdfDocument:updateHighlightContents(pageno, item, contents)
     if annot ~= nil then
         page:updateMarkupAnnotation(annot, contents)
         self:resetTileCacheValidity()
+        self:_purgeDisplayListCache()
     end
     page:close()
 end
@@ -359,8 +376,8 @@ function PdfDocument:renderPage(pageno, rect, zoom, rotation, gamma, saturation,
     return self.koptinterface:renderPage(self, pageno, rect, zoom, rotation, gamma, saturation, hinting)
 end
 
-function PdfDocument:hintPage(pageno, zoom, rotation, gamma, saturation)
-    return self.koptinterface:hintPage(self, pageno, zoom, rotation, gamma, saturation)
+function PdfDocument:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
+    return self.koptinterface:hintPage(self, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
 end
 
 function PdfDocument:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, saturation)
@@ -414,6 +431,511 @@ function PdfDocument:register(registry)
     registry:addProvider("tiff", "image/tiff", self, 90)
     -- Windows Media Photo == JPEG XR
     registry:addProvider("wdp", "image/vnd.ms-photo", self, 90)
+end
+
+--
+-- Asynchronous background hinting (c.f., base/mupdf_worker.c)
+--
+-- The main thread records an immutable display list (cheap), hands it to a
+-- persistent worker thread which rasterizes it on a cloned MuPDF context,
+-- and polls for completion on the UIManager loop. When a synchronous
+-- renderPage request collides with an in-flight hint, the job is coalesced
+-- by waiting out only its remaining execution time.
+--
+
+local COALESCE_WAIT_MS = 250  -- bounded wait for the first coalescing attempt
+local ABORT_WAIT_MS = 50      -- grace period for cooperative cancellation
+local POLL_INTERVAL_S = 0.02  -- UIManager polling cadence for job completion
+
+--- Initialize the background worker once per process.
+-- @return true when the worker is available.
+function PdfDocument:_ensureWorker()
+    if self._worker_broken then
+        return false
+    end
+    if not self._worker_initialized then
+        local ok, ret = pcall(pdf.workerInit)
+        if not ok then
+            logger.warn("PdfDocument: cannot initialize background worker:", ret)
+            self._worker_broken = true
+            return false
+        end
+        if ret ~= 0 then
+            logger.warn("PdfDocument: background worker init failed with code", ret)
+            self._worker_broken = true
+            return false
+        end
+        self._worker_initialized = true
+    end
+    return true
+end
+
+function PdfDocument:_colorspaceForWorker()
+    if self.render_color then
+        return pdf.bgr and pdf.WORKER_CS_BGR or pdf.WORKER_CS_RGB
+    end
+    return pdf.WORKER_CS_GRAY
+end
+
+--- Fetch the page's display list through the 2-slot LRU (MRU in slot 1).
+-- The list is resolution-independent — zoom, rotation, gamma and saturation
+-- live in the raster matrix the worker applies when running it — so one
+-- build serves every viewport slice hinted on the page. Slot 1 is the most
+-- recently used page, slot 2 the runner-up (current + predicted-next page
+-- covers the entire 2-column navigation flow).
+-- @return dlist (or nil on build failure), the cache entry, true when the
+-- list was just built (false on a cache hit).
+function PdfDocument:_getDisplayList(pageno)
+    local slots = self._display_list_slots
+    local entry = slots[1]
+    if entry.pageno == pageno then
+        return entry.dlist, entry, false
+    end
+    entry = slots[2]
+    if entry.pageno == pageno then
+        -- Refresh: promote to MRU.
+        slots[2], slots[1] = slots[1], slots[2]
+        return slots[1].dlist, slots[1], false
+    end
+
+    -- Miss: evict the LRU slot and build the list fresh. The document
+    -- reference keeps the entry alive; the worker takes its own reference
+    -- at submit time, so evicting (or closing) while a job runs is safe.
+    local lru = slots[2]
+    if lru.dlist then
+        pdf.dropDisplayList(lru.dlist)
+        lru.dlist = nil
+        lru.pageno = nil
+    end
+
+    local page = self._document:openPage(pageno)
+    local ok, dlist = pcall(pdf.newDisplayListFromPage, page)
+    if not ok then
+        page:close()
+        logger.warn("PdfDocument: display list creation failed:", tostring(dlist))
+        return nil
+    end
+    -- Per-page metadata the dispatch step would otherwise re-derive (and
+    -- re-open the page for) on every hint. The bounds ride along from the
+    -- same page pass; the transparency flag is stored raw and only applied
+    -- when background_cleanup is active at dispatch time.
+    local page_w, page_h = page:getSize(self.dc_null)
+    local has_transparency_mask = pdf.pageHasTransparencyMask(page.ctx, page.page) ~= 0
+    page:close()
+
+    -- Demote the previous MRU, store the fresh build as MRU.
+    slots[2] = slots[1]
+    slots[1] = {
+        pageno = pageno,
+        dlist = dlist,
+        page_bbox = { w = page_w, h = page_h },
+        has_transparency_mask = has_transparency_mask,
+    }
+    return dlist, slots[1], true
+end
+
+--- Drop every cached display list (content mutated, or document closing).
+function PdfDocument:_purgeDisplayListCache()
+    for i = 1, 2 do
+        local entry = self._display_list_slots[i]
+        if entry.dlist then
+            pdf.dropDisplayList(entry.dlist)
+            entry.dlist = nil
+            entry.pageno = nil
+        end
+    end
+end
+
+--- Whether an in-flight job's target is still worth its runtime: it matches
+-- the view the user is actually looking at (the last paint, c.f.,
+-- Document:drawPage recording _active_view) or the hint just parked.
+-- A nil rect means the whole page, which covers any viewport slice of it.
+local function _jobMatchesTarget(job, pageno, rect, zoom, rotation, gamma, saturation)
+    return job.pageno == pageno
+        and job.zoom == zoom
+        and job.rotation == rotation
+        and job.gamma == gamma
+        and job.saturation == saturation
+        and (job.rect == nil or (rect ~= nil and tostring(job.rect) == tostring(rect)))
+end
+
+function PdfDocument:_jobStillRelevant(job)
+    local pending = self._pending_hint
+    if pending and _jobMatchesTarget(job, pending.pageno, pending.rect,
+            pending.zoom, pending.rotation, pending.gamma, pending.saturation) then
+        return true
+    end
+    local active = self._active_view
+    if not active then
+        -- No view recorded yet (before the first paint): keep the job.
+        return true
+    end
+    return job.pageno == active.pageno
+        and job.zoom == active.zoom
+        and job.rotation == active.rotation
+        and job.gamma == active.gamma
+        and job.saturation == active.saturation
+        and (job.rect == nil or active.rect == nil
+            or tostring(job.rect) == tostring(active.rect))
+end
+
+--- Park the latest opportunistic hint while the worker is busy (latest
+-- wins); _dispatchPendingHint runs it as soon as the worker goes idle.
+function PdfDocument:_queuePendingHint(pageno, rect, zoom, rotation, gamma, saturation)
+    local job = self._in_flight_job
+    if _jobMatchesTarget(job, pageno, rect, zoom, rotation, gamma, saturation) then
+        -- The running job already renders exactly this target.
+        PerfProfile.log("PENDING_HINT_COVERED page=%d", pageno)
+        return
+    end
+    self._pending_hint = {
+        pageno = pageno,
+        rect = rect,
+        zoom = zoom,
+        rotation = rotation,
+        gamma = gamma,
+        saturation = saturation,
+    }
+    -- If what the worker is currently rendering is neither the active view
+    -- nor the hint we just parked, nothing can consume it anymore: abort it
+    -- (which dispatches the parked hint immediately, the worker idling into
+    -- the new request) instead of letting the user reach the target while
+    -- its tile still doesn't exist.
+    if not self:_jobStillRelevant(job) then
+        PerfProfile.log("PENDING_HINT_ABORT_OBSOLETE job_page=%d new_page=%d",
+            job.pageno, pageno)
+        self:_abortInFlightJob()
+    else
+        PerfProfile.log("PENDING_HINT_QUEUED page=%d job_page=%d", pageno, job.pageno)
+    end
+end
+
+--- Dispatch a hint parked by _queuePendingHint; called whenever the worker
+-- transitions to idle (job committed, aborted or failed).
+function PdfDocument:_dispatchPendingHint()
+    local pending = self._pending_hint
+    if not pending then
+        return
+    end
+    self._pending_hint = nil
+    PerfProfile.log("PENDING_HINT_DISPATCH page=%d rect=%s",
+        pending.pageno, tostring(pending.rect))
+    -- Dispatched with dispatch_only semantics: a dedupe hit (the tile is
+    -- already committed) counts as handled, never as a drop.
+    if not self:hintPageAsync(pending.pageno, pending.rect, pending.zoom,
+            pending.rotation, pending.gamma, pending.saturation, true) then
+        -- Rare submit failure on a still-retiring worker: the next
+        -- paint-anchored hint cycle regenerates the prediction anyway.
+        PerfProfile.log("PENDING_HINT_DROPPED page=%d", pending.pageno)
+    end
+end
+
+--- Attempt to dispatch a hint to the background worker.
+-- @return true when dispatched or otherwise handled asynchronously
+-- (completion is polled), false when the caller should fall back to the
+-- synchronous path.
+function PdfDocument:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturation, dispatch_only)
+    if not self:_ensureWorker() then
+        return false
+    end
+    if self._in_flight_job then
+        if dispatch_only then
+            -- Opportunistic re-hint while the worker is busy: park it
+            -- (latest wins) instead of dropping it on the floor — dropped
+            -- wrap hints are what left the top of Column 2 cold on
+            -- image-heavy pages. _dispatchPendingHint runs it the instant
+            -- the worker idles. Never fall back to the synchronous path
+            -- here: it would block or abort the running job.
+            self:_queuePendingHint(pageno, rect, zoom, rotation, gamma, saturation)
+            return true
+        end
+        -- Don't overlap worker requests; the synchronous fallback in
+        -- Document:hintPage will coalesce with the in-flight job.
+        return false
+    end
+
+    -- Compute the render target exactly like Document:renderPage would.
+    local size
+    if rect then
+        size = rect
+    else
+        size = self:getPageDimensions(pageno, zoom, rotation)
+    end
+    local size_x = size.x or 0
+    local size_y = size.y or 0
+
+    -- Skip re-dispatching a target that was just committed (onHintPage can
+    -- fire several times for the same page within one view lifecycle).
+    local hash = self:getFullPageHash(pageno, zoom, rotation, gamma, saturation)
+    if rect then
+        hash = hash .. "|" .. tostring(rect)
+    end
+    if hash == self._last_committed_hash then
+        -- Already committed; for opportunistic hints report success so the
+        -- caller doesn't fall back to a sync render of cached content.
+        if dispatch_only then
+            return true
+        end
+        return false
+    end
+
+    -- 1. Main-thread step: fetch (or record) the immutable display list.
+    --    A cache hit is free; a build parses the content stream (typically
+    --    a few ms, noticeably more with embedded images — the reason the
+    --    list is cached across a page's viewport slices at all).
+    local perf_dlist = PerfProfile.enabled and PerfProfile.now()
+    local dlist, dl_entry, dl_fresh = self:_getDisplayList(pageno)
+    if not dlist then
+        return false
+    end
+    if perf_dlist then
+        PerfProfile.log("DLIST_CACHE state=%s page=%d size=%.0fx%.0f duration=%.2f",
+            dl_fresh and "build" or "hit", pageno,
+            dl_entry.page_bbox.w, dl_entry.page_bbox.h,
+            PerfProfile.now() - perf_dlist)
+    end
+    local transparency_mask = (self.configurable.background_cleanup or 0) ~= 0
+        and dl_entry.has_transparency_mask or false
+
+    -- 2. Allocate the destination buffer (anchored on the job table below
+    --    so LuaJIT's GC cannot reclaim it while the worker writes into it).
+    local bb = Blitbuffer.new(size.w, size.h, self.render_color and self.color_bb_type or nil)
+    if bb.stride ~= size.w * (self.render_color and 4 or 1) then
+        -- The worker pixmap assumes the default stride; bail out otherwise.
+        logger.warn("PdfDocument: unexpected blitbuffer stride, hint stays synchronous")
+        return false
+    end
+
+    -- The CTM is a plain scale (plus rotation): the pixmap bbox below already
+    -- anchors the render at (size_x, size_y) in device space, exactly like the
+    -- synchronous path (c.f., page:draw_new's bbox + untransimated ctm).
+    -- Translating here as well double-counts the excerpt origin and shifts
+    -- every rect-anchored worker tile by that origin (visible as content drawn
+    -- offset to the right and cut at the screen edge on ink-offset pages).
+    local ctm = pdf.makeCTM(zoom, rotation, 0, 0)
+    local bbox = ffi.new("fz_irect", size_x, size_y, size_x + size.w, size_y + size.h)
+    local scissor = ffi.new("fz_rect", size_x, size_y, size_x + size.w, size_y + size.h)
+
+    -- 3. Dispatch to the background thread. Gamma and saturation travel
+    --    with the job: the worker applies them right after rasterizing,
+    --    keeping 20-35MB buffer passes off the UI thread on commit.
+    local res = pdf.workerSubmit(dlist, ctm, scissor, bbox,
+        ffi.cast("unsigned char*", bb.data), bb.stride,
+        self:_colorspaceForWorker(),
+        self.render_color and 1 or 0,
+        transparency_mask and 1 or 0,
+        gamma, saturation)
+    if res ~= 0 then
+        logger.warn("PdfDocument: worker submit failed, hint stays synchronous")
+        return false
+    end
+    -- The worker took its own reference (released when the job finishes);
+    -- the cache's reference keeps the list alive for the remaining viewport
+    -- slices of this page, so nothing to drop here.
+
+    -- While a job is in flight, wake up an auxiliary core for it (matching
+    -- the sync renderPage lifecycle in Document:renderPage/KoptInterface);
+    -- released when the job commits, aborts or fails.
+    CanvasContext:enableCPUCores(2)
+
+    -- 4. Anchor the in-flight job (buffer GC anchor + coalescing metadata);
+    --    the hash was computed (and de-duplicated) at the top of this method.
+    self._in_flight_job = {
+        pageno = pageno,
+        rect = rect, -- nil for full-page hints
+        size = size,
+        zoom = zoom,
+        rotation = rotation,
+        gamma = gamma,
+        saturation = saturation,
+        hash = hash,
+        bb = bb,
+    }
+
+    -- 5. Poll for completion on the UIManager loop (never blocks).
+    local function pollWorker()
+        if not self._in_flight_job then
+            return
+        end
+        local status = pdf.workerStatus()
+        if status == pdf.WORKER_RUNNING then
+            UIManager:scheduleIn(POLL_INTERVAL_S, pollWorker)
+        elseif status == pdf.WORKER_DONE then
+            self:_commitInFlightJob()
+        else -- WORKER_ERROR or WORKER_ABORTED
+            PerfProfile.log("ASYNC_FAIL page=%d status=%d", self._in_flight_job.pageno, status)
+            self._in_flight_job = nil
+            self._in_flight_poll = nil
+            CanvasContext:enableCPUCores(1)
+        end
+    end
+    self._in_flight_poll = pollWorker
+    UIManager:scheduleIn(POLL_INTERVAL_S, pollWorker)
+    return true
+end
+
+--- Commit a completed in-flight job to the tile cache. Gamma and saturation
+-- were already applied by the worker (c.f., mupdf_worker.c).
+function PdfDocument:_commitInFlightJob()
+    local job = self._in_flight_job
+    if not job then
+        return
+    end
+
+    local t0 = PerfProfile.enabled and PerfProfile.now()
+
+    local tile = TileCacheItem:new{
+        persistent = true,
+        doc_path = self.file,
+        created_ts = os.time(),
+        excerpt = job.size,
+        pageno = job.pageno,
+        bb = job.bb,
+    }
+    tile.size = tonumber(tile.bb.stride) * tile.bb.h + 512
+    DocCache:insert(job.hash, tile)
+
+    -- Remember the committed target so duplicate hints don't re-dispatch
+    -- identical work. Only track tiles the cache actually retained; under a
+    -- shrunken budget a retry (and its eventual cold paint) stays available.
+    if DocCache:willAccept(tile.size) then
+        self._last_committed_hash = job.hash
+    end
+
+    self._in_flight_job = nil
+    self._in_flight_poll = nil
+    CanvasContext:enableCPUCores(1)
+    if t0 then
+        PerfProfile.log("ASYNC_COMMIT_MS page=%d duration=%.2f hash=%s",
+            job.pageno, PerfProfile.now() - t0, job.hash)
+    end
+    -- The worker just went idle: run the opportunistic hint parked for
+    -- exactly this moment (c.f., _queuePendingHint), if any.
+    self:_dispatchPendingHint()
+end
+
+--- Cancel the in-flight job, anchoring its buffer as a zombie until the
+-- worker confirms it stopped writing into it.
+function PdfDocument:_abortInFlightJob()
+    local job = self._in_flight_job
+    if not job then
+        return
+    end
+    pdf.workerAbort()
+    pdf.workerWait(ABORT_WAIT_MS)
+    self._in_flight_job = nil
+    self._in_flight_poll = nil
+    CanvasContext:enableCPUCores(1)
+    if pdf.workerStatus() == pdf.WORKER_RUNNING then
+        -- Rare: cooperative cancellation hasn't landed yet; keep the buffer
+        -- anchored until the worker goes idle.
+        table.insert(self._zombie_jobs, job)
+        self:_scheduleZombieRetirement()
+    end
+    -- The worker is idle (or about to be): run the hint parked for this
+    -- moment, if any. On a still-retiring zombie the submit simply fails
+    -- and the parked hint is dropped (the next hint cycle regenerates it).
+    self:_dispatchPendingHint()
+end
+
+function PdfDocument:_scheduleZombieRetirement()
+    if self._zombie_poll_scheduled then
+        return
+    end
+    self._zombie_poll_scheduled = true
+    local function retireZombies()
+        self._zombie_poll_scheduled = false
+        if pdf.workerStatus() == pdf.WORKER_RUNNING then
+            self._zombie_poll_scheduled = true
+            UIManager:scheduleIn(POLL_INTERVAL_S, retireZombies)
+            return
+        end
+        self._zombie_jobs = {}
+    end
+    UIManager:scheduleIn(POLL_INTERVAL_S, retireZombies)
+end
+
+--- Resolve an in-flight background hint against a synchronous renderPage
+-- request, implementing coalescing.
+-- @return "committed" when the job's tile is now in the cache (caller
+-- proceeds and finds it), "covered" when an async job already renders
+-- exactly this request (only safe for hinting callers, which may skip),
+-- or nil when the caller must render synchronously.
+function PdfDocument:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, saturation, hinting)
+    local job = self._in_flight_job
+    if not job then
+        return nil
+    end
+
+    local same_target = job.pageno == pageno
+        and job.zoom == zoom
+        and job.rotation == rotation
+        and job.gamma == gamma
+        and job.saturation == saturation
+        and (job.rect == nil or (rect ~= nil and tostring(job.rect) == tostring(rect)))
+
+    if same_target then
+        if pdf.workerStatus() == pdf.WORKER_DONE then
+            -- Completion raced ahead of the poller: commit now.
+            self:_commitInFlightJob()
+            return "committed"
+        end
+        if hinting then
+            -- A duplicate hint; the async job already covers it.
+            return "covered"
+        end
+        -- Synchronous user request: wait out the remaining slice of the
+        -- rasterization instead of duplicating it on the main thread.
+        PerfProfile.log("COALESCE page=%d", pageno)
+        local status = pdf.workerWait(COALESCE_WAIT_MS)
+        if status ~= pdf.WORKER_DONE then
+            -- Slow worker (a background core can clock down hard on some
+            -- devices): an unbounded wait here freezes the UI for seconds.
+            -- Abandon the job (cooperative abort lands at the next
+            -- scanline checkpoint) and let the caller render it on the
+            -- much-awake main thread instead. The zombie anchoring below
+            -- keeps the job's buffer safe if the abort is still pending.
+            PerfProfile.log("COALESCE_TIMEOUT page=%d", pageno)
+            self:_abortInFlightJob()
+            return nil
+        end
+        self:_commitInFlightJob()
+        return "committed"
+    end
+
+    -- Low-zoom unhinted renders without a rect are margin probes (auto-crop
+    -- / bbox inspection and the like): they are tiny, independent of the
+    -- user's next view, and must not cancel an active full-zoom viewport
+    -- job that the very next tap is about to consume. Let them render
+    -- alongside instead of aborting anything.
+    if not hinting and rect == nil and zoom < 0.5 then
+        return nil
+    end
+
+    -- Obsolete job (different page or params): cancel it and render sync.
+    self:_abortInFlightJob()
+    return nil
+end
+
+function PdfDocument:close()
+    self._pending_hint = nil
+    if self._in_flight_job or self._in_flight_poll then
+        pdf.workerAbort()
+        -- Wait unconditionally: the buffer is about to be released, the
+        -- worker must not touch it anymore. Cooperative abort makes this
+        -- quick, and we're tearing the document down anyway.
+        pdf.workerWait(-1)
+        self._in_flight_job = nil
+        self._in_flight_poll = nil
+        CanvasContext:enableCPUCores(1)
+    end
+    if self._in_flight_poll then
+        UIManager:unschedule(self._in_flight_poll)
+        self._in_flight_poll = nil
+    end
+    self._zombie_jobs = {}
+    self:_purgeDisplayListCache()
+    return Document.close(self)
 end
 
 return PdfDocument

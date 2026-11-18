@@ -18,6 +18,7 @@ local Utf8Proc = require("ffi/utf8proc")
 local logger = require("logger")
 local util = require("util")
 local ffi = require("ffi")
+local PerfProfile = require("perfprofile")
 
 require "ffi/posix_h"
 
@@ -219,10 +220,19 @@ function KoptInterface:getAutoBBox(doc, pageno)
     local hash = table.concat(hash_list, "|")
     local cached = DocCache:check(hash)
     if not cached then
+        local perf_t0 = PerfProfile.enabled and PerfProfile.now()
         local page = doc._document:openPage(pageno)
         local kc = self:createContext(doc, pageno, bbox)
         page:getPagePix(kc, doc.render_mode, doc.configurable.background_cleanup)
         local x0, y0, x1, y1 = kc:getAutoBBox()
+        if perf_t0 then
+            PerfProfile.log("BBOX_PROBE_MS page=%d duration=%.2f", pageno, PerfProfile.now() - perf_t0)
+            -- TEMP DIAGNOSTIC (round 3.5): device shows cropped views after
+            -- turns in contentwidth+auto-crop; log the raw probe result so
+            -- busy-worker vs idle-worker probes can be compared.
+            PerfProfile.log("BBOX_PROBE_RES page=%d bbox=%.1f,%.1f,%.1f,%.1f",
+                pageno, x0, y0, x1, y1)
+        end
         local w, h = native_size.w, native_size.h
         if (x1 - x0)/w > 0.1 or (y1 - y0)/h > 0.1 then
             bbox.x0, bbox.y0, bbox.x1, bbox.y1 = x0, y0, x1, y1
@@ -599,7 +609,7 @@ function KoptInterface:renderOptimizedPage(doc, pageno, rect, zoom, rotation, hi
     return tile
 end
 
-function KoptInterface:hintPage(doc, pageno, zoom, rotation, gamma, saturation)
+function KoptInterface:hintPage(doc, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
     --- @note: Crappy safeguard around memory issues like in #7627: if we're eating too much RAM, drop half the cache...
     DocCache:memoryPressureCheck()
 
@@ -608,7 +618,7 @@ function KoptInterface:hintPage(doc, pageno, zoom, rotation, gamma, saturation)
     elseif self:is_optimizing_page(doc) then
         self:renderOptimizedPage(doc, pageno, nil, zoom, rotation, true)
     else
-        Document.hintPage(doc, pageno, zoom, rotation, gamma, saturation)
+        Document.hintPage(doc, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
     end
 end
 
