@@ -1,5 +1,7 @@
 local EventListener = require("ui/widget/eventlistener")
 local Geom = require("ui/geometry")
+local PerfProfile = require("perfprofile")
+local pdf = require("ffi/mupdf")
 
 local DHINTCOUNT = G_defaults:readSetting("DHINTCOUNT")
 
@@ -13,6 +15,18 @@ end
 
 function ReaderHinting:onHintPage(_, opportunistic)
     if not self.view.hinting then return true end
+    -- A cycle that starts with the worker mid-job cannot produce dispatchable
+    -- params: the bbox probes it needs would either defer (answering with the
+    -- stored/full-page bbox → a zoom/rect pair the next paint can never
+    -- request) or race the running job (openPage on the main thread while it
+    -- rasterizes). Skip the whole cycle: the paint always resolves the
+    -- in-flight job (coalesce or abort), so the post-paint cycle re-fires
+    -- with the worker idle (round 3.8).
+    if pdf.workerStatus() == pdf.WORKER_RUNNING then
+        PerfProfile.log("HINT_CYCLE_SKIPPED_BUSY opportunistic=%s",
+            tostring(opportunistic))
+        return true
+    end
     -- Ask the paging module what the next interaction in the active reading
     -- direction would display: a pan segment on the current page (including
     -- intra-column steps and same-page column wraps), or the entry edge of
@@ -25,35 +39,43 @@ function ReaderHinting:onHintPage(_, opportunistic)
         and self.ui.paging:getNextViewHint()
     if predicted and predicted.page >= 1
             and predicted.page <= self.document.info.number_of_pages then
-        -- Pure evaluation: getZoom would apply the *future* page's crop
-        -- decision to the view (c.f., ReaderZooming:getZoomForPage).
-        local zoom, use_bbox = self.zoom:getZoomForPage(predicted.page)
-        self.document:hintPage(
-            predicted.page,
-            zoom,
-            self.view.state.rotation,
-            self.view.state.gamma,
-            self.view.state.saturation,
-            predicted.rect,
-            opportunistic,
-            use_bbox)
+        -- An intra-page pan predicts a view of the page being displayed:
+        -- its params are the ones that view renders with, so reuse them
+        -- instead of re-evaluating (which would redo the bbox probe and
+        -- could diverge from predicted.rect if the worker turned busy in
+        -- between) (round 3.8).
+        local zoom, use_bbox
+        if predicted.page == self.view.state.page and self.view.state.zoom then
+            zoom = self.view.state.zoom
+            use_bbox = self.view.use_bbox
+        else
+            -- Pure evaluation: getZoom would apply the *future* page's crop
+            -- decision to the view (c.f., ReaderZooming:getZoomForPage).
+            zoom, use_bbox = self.zoom:getZoomForPage(predicted.page)
+        end
+        -- Evaluate every slot BEFORE the first dispatch: once slot 1 is
+        -- submitted the worker is busy, and any later evaluation would hit
+        -- the deferred-probe path above. Evaluated up front (worker idle),
+        -- the remaining slots park in _pending_hint with REAL params and
+        -- dispatch the instant slot 1's job commits (round 3.8).
+        local slots = {
+            { pageno = predicted.page, rect = predicted.rect,
+              zoom = zoom, use_bbox = use_bbox },
+        }
         -- Any remaining hint slots (DHINTCOUNT > 1) target the following
         -- pages at their forward entry edge.
         for i = 2, DHINTCOUNT do
             local pageno = self.view.state.page + i
             if pageno <= self.document.info.number_of_pages then
                 local z, ub = self.zoom:getZoomForPage(pageno)
-                self.document:hintPage(
-                    pageno,
-                    z,
-                    self.view.state.rotation,
-                    self.view.state.gamma,
-                    self.view.state.saturation,
-                    self:getEntryEdgeRect(pageno, 1, z, ub),
-                    opportunistic,
-                    ub)
+                slots[#slots + 1] = {
+                    pageno = pageno,
+                    rect = self:getEntryEdgeRect(pageno, 1, z, ub),
+                    zoom = z, use_bbox = ub,
+                }
             end
         end
+        self:_dispatchHintSlots(slots, opportunistic)
         return true
     end
 
@@ -64,22 +86,41 @@ function ReaderHinting:onHintPage(_, opportunistic)
     -- at an edge (a carried-over y offset would poison the excerpt cache
     -- key on every page transition).
     local dir = (self.ui.paging and self.ui.paging.last_view_rel_diff) or 1
+    local slots = {}
     for i = 1, DHINTCOUNT do
         local pageno = self.view.state.page + (dir > 0 and i or -i)
         if pageno >= 1 and pageno <= self.document.info.number_of_pages then
             local zoom, use_bbox = self.zoom:getZoomForPage(pageno)
-            self.document:hintPage(
-                pageno,
-                zoom,
-                self.view.state.rotation,
-                self.view.state.gamma,
-                self.view.state.saturation,
-                self:getEntryEdgeRect(pageno, dir, zoom, use_bbox),
-                opportunistic,
-                use_bbox)
+            slots[#slots + 1] = {
+                pageno = pageno,
+                rect = self:getEntryEdgeRect(pageno, dir, zoom, use_bbox),
+                zoom = zoom, use_bbox = use_bbox,
+            }
         end
     end
+    self:_dispatchHintSlots(slots, opportunistic)
     return true
+end
+
+--- Dispatch evaluated hint slots. Slot 1 may fall back to the synchronous
+-- path (it is the prediction the next paint is most likely to request);
+-- the remaining slots are dispatch_only: with the worker busy (slot 1's
+-- job) they park instead of dropping to a synchronous render — that
+-- fallback would enter renderPage → resolveInFlightHint with a different
+-- target and KILL slot 1's in-flight job to render page+2 on the main
+-- thread (round 3.8).
+function ReaderHinting:_dispatchHintSlots(slots, opportunistic)
+    for i, slot in ipairs(slots) do
+        self.document:hintPage(
+            slot.pageno,
+            slot.zoom,
+            self.view.state.rotation,
+            self.view.state.gamma,
+            self.view.state.saturation,
+            slot.rect,
+            (i > 1 or opportunistic) and true or nil,
+            slot.use_bbox)
+    end
 end
 
 --- Viewport-sized rect at the edge page `pageno` is entered on: its top for
@@ -92,7 +133,7 @@ function ReaderHinting:getEntryEdgeRect(pageno, dir, zoom, use_bbox)
     if not zoom then
         zoom, use_bbox = self.zoom:getZoomForPage(pageno)
     end
-    local page_area = self.view:getPageArea(pageno, zoom, self.view.state.rotation, use_bbox)
+    local page_area = self.view:getPageArea(pageno, zoom, self.view.state.rotation, use_bbox, true)
     local w = math.min(self.view.dimen.w, page_area.w)
     local h = self.view.dimen.h
     if self.view.footer_visible and self.view.footer

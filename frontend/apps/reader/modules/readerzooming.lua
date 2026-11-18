@@ -547,13 +547,27 @@ end
 -- flag from those would make the *displayed* page's next recalculate mix
 -- its own zoom with a foreign page's crop decision — the "crop changes
 -- when revisited / when panning" bug (round 3.7).
+-- @tfield bool defer_busy when true (the default — hint paths evaluate
+-- upcoming pages), a bbox probe the background worker would race with is
+-- deferred and the stored/full-page bbox answers this evaluation instead
+-- (UNCACHED, retried by a later evaluation). The caller evaluating the page
+-- actually being displayed (ReaderZooming:getZoom) passes false: the zoom
+-- and the page area the view anchors to MUST come from the same, real bbox
+-- — a deferred answer here would lock state.zoom at the uncropped zoom
+-- while the immediately-following getPageArea call probes and caches the
+-- cropped bbox, rendering the page shrunk inside its crop with no retry
+-- (round 3.8). With defer_busy=false the probe site cancels the worker
+-- instead of racing it (c.f., KoptInterface:getAutoBBox).
 -- @return zoom, use_bbox (whether the page's content bbox governs the view)
-function ReaderZooming:getZoomForPage(pageno)
+function ReaderZooming:getZoomForPage(pageno, defer_busy)
+    if defer_busy == nil then
+        defer_busy = true
+    end
     local zoom
     local page_size = self.ui.document:getNativePageDimensions(pageno)
     local use_bbox = false
     if not (self.zoom_mode and self.zoom_mode:match("^page") or self.ui.document.configurable.trim_page == 3) then
-        local ubbox_dimen = self.ui.document:getUsedBBoxDimensions(pageno, 1, nil, true)
+        local ubbox_dimen = self.ui.document:getUsedBBoxDimensions(pageno, 1, nil, defer_busy)
         -- if bbox is larger than the native page dimension render the full page
         -- See discussion in koreader/koreader#970.
         if ubbox_dimen.w <= page_size.w and ubbox_dimen.h <= page_size.h
@@ -642,7 +656,7 @@ function ReaderZooming:getZoom(pageno)
             tostring(self.zoom_factor),
             tostring(self.view.state.page))
     end
-    local zoom, use_bbox, zoom_w, zoom_h = self:getZoomForPage(pageno)
+    local zoom, use_bbox, zoom_w, zoom_h = self:getZoomForPage(pageno, false)
     if self.view.state.page == nil or pageno == self.view.state.page then
         self.view:onBBoxUpdate(use_bbox and true or false)
     end

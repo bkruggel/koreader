@@ -28,7 +28,6 @@ function PdfDocument:init()
     self.koptinterface = require("document/koptinterface")
     self.koptinterface:setDefaultConfigurable(self.configurable)
     -- Async rendering engine state (see hintPageAsync below)
-    self._zombie_jobs = {}
     self._worker_broken = false
     self._worker_initialized = false
     -- 2-slot LRU of per-page display lists (see _getDisplayList): one zoomed
@@ -444,7 +443,6 @@ end
 --
 
 local COALESCE_WAIT_MS = 250  -- bounded wait for the first coalescing attempt
-local ABORT_WAIT_MS = 50      -- grace period for cooperative cancellation
 local POLL_INTERVAL_S = 0.02  -- UIManager polling cadence for job completion
 
 --- Initialize the background worker once per process.
@@ -819,45 +817,26 @@ function PdfDocument:_commitInFlightJob()
     self:_dispatchPendingHint()
 end
 
---- Cancel the in-flight job, anchoring its buffer as a zombie until the
--- worker confirms it stopped writing into it.
+--- Cancel the in-flight job and wait until the worker has actually stopped
+-- writing into its buffer. The cooperative abort lands at the next render
+-- checkpoint or saturation scanline (and the gamma pass is bounded by the
+-- pixmap size), so this blocks for milliseconds — but it MUST block: the
+-- old 50 ms grace period returned while a slow job was still WORKER_RUNNING,
+-- and the caller then rendered on the main thread / opened pages alongside
+-- it (round 3.8). Returning only when the worker is idle makes every
+-- _abortInFlightJob caller safe by construction.
 function PdfDocument:_abortInFlightJob()
     local job = self._in_flight_job
     if not job then
         return
     end
     pdf.workerAbort()
-    pdf.workerWait(ABORT_WAIT_MS)
+    pdf.workerWait(-1)
     self._in_flight_job = nil
     self._in_flight_poll = nil
     CanvasContext:enableCPUCores(1)
-    if pdf.workerStatus() == pdf.WORKER_RUNNING then
-        -- Rare: cooperative cancellation hasn't landed yet; keep the buffer
-        -- anchored until the worker goes idle.
-        table.insert(self._zombie_jobs, job)
-        self:_scheduleZombieRetirement()
-    end
-    -- The worker is idle (or about to be): run the hint parked for this
-    -- moment, if any. On a still-retiring zombie the submit simply fails
-    -- and the parked hint is dropped (the next hint cycle regenerates it).
+    -- The worker is idle: run the hint parked for this moment, if any.
     self:_dispatchPendingHint()
-end
-
-function PdfDocument:_scheduleZombieRetirement()
-    if self._zombie_poll_scheduled then
-        return
-    end
-    self._zombie_poll_scheduled = true
-    local function retireZombies()
-        self._zombie_poll_scheduled = false
-        if pdf.workerStatus() == pdf.WORKER_RUNNING then
-            self._zombie_poll_scheduled = true
-            UIManager:scheduleIn(POLL_INTERVAL_S, retireZombies)
-            return
-        end
-        self._zombie_jobs = {}
-    end
-    UIManager:scheduleIn(POLL_INTERVAL_S, retireZombies)
 end
 
 --- Resolve an in-flight background hint against a synchronous renderPage
@@ -934,7 +913,6 @@ function PdfDocument:close()
         UIManager:unschedule(self._in_flight_poll)
         self._in_flight_poll = nil
     end
-    self._zombie_jobs = {}
     self:_purgeDisplayListCache()
     return Document.close(self)
 end

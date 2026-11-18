@@ -581,13 +581,19 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
     -- hint_rect against the native page's origin instead of the cropped
     -- area's — a rect the first paint after the turn can never request
     -- (round 3.7).
+    -- A rect==nil hint allocates the *uncropped* page (hintPageAsync sizes
+    -- its buffer from getPageDimensions), so the cache budget is checked
+    -- against that allocation, not the cropped area — otherwise a tile the
+    -- cache silently drops at commit time would be rasterized in full
+    -- (round 3.8).
+    local full_page_size = self:getPageDimensions(pageno, zoom, rotation)
     local page_size
     if use_bbox then
         page_size = self:getUsedBBoxDimensions(pageno, zoom, rotation, true)
     else
-        page_size = self:getPageDimensions(pageno, zoom, rotation)
+        page_size = full_page_size
     end
-    local needed_bytes = page_size.w * page_size.h * (self.render_color and 4 or 1) + 512
+    local needed_bytes = full_page_size.w * full_page_size.h * (self.render_color and 4 or 1) + 512
     local screen_area = CanvasContext:getWidth() * CanvasContext:getHeight()
     local reason
     if not DocCache:willAccept(needed_bytes) then
@@ -602,12 +608,24 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
         reason = "zoom"
     end
     if reason then
+        -- hint_rect and page_size both live in zoomed document pixels, but a
+        -- cropped page's Geom carries a NON-ZERO origin (the bbox left/top
+        -- margin): clamp against the bbox's absolute bounds, not its w/h —
+        -- otherwise every rect below/right of the origin is shifted and
+        -- shrunk by the margin, and column 2 rects can even end up with a
+        -- negative width (round 3.8).
+        local px = page_size.x or 0
+        local py = page_size.y or 0
+        local limit_x = px + page_size.w
+        local limit_y = py + page_size.h
         if hint_rect then
+            local rx = math.max(px, math.min(hint_rect.x or 0, limit_x))
+            local ry = math.max(py, math.min(hint_rect.y or 0, limit_y))
             rect = Geom:new{
-                x = math.min(hint_rect.x or 0, page_size.w),
-                y = math.min(hint_rect.y or 0, page_size.h),
-                w = math.min(hint_rect.w, page_size.w - (hint_rect.x or 0)),
-                h = math.min(hint_rect.h, page_size.h - (hint_rect.y or 0)),
+                x = rx,
+                y = ry,
+                w = math.min(hint_rect.w, limit_x - rx),
+                h = math.min(hint_rect.h, limit_y - ry),
             }
         else
             -- No view-provided rect: clip to the visible screen. Note that
@@ -616,8 +634,8 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
             -- Anchor at the page area's origin: for a cropped page that is
             -- the bbox origin, the frame the first paint requests in.
             rect = Geom:new{
-                x = page_size.x or 0,
-                y = page_size.y or 0,
+                x = px,
+                y = py,
                 w = math.min(page_size.w, CanvasContext:getWidth()),
                 h = math.min(page_size.h, CanvasContext:getHeight()),
             }

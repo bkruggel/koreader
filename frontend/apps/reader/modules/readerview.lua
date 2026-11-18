@@ -762,14 +762,21 @@ function ReaderView:drawHighlightRect(bb, _x, _y, rect, drawer, color, draw_note
     end
 end
 
-function ReaderView:getPageArea(page, zoom, rotation, force_use_bbox)
+function ReaderView:getPageArea(page, zoom, rotation, force_use_bbox, defer_busy)
     -- force_use_bbox lets callers evaluate a page other than the displayed
     -- one with that page's own crop decision (hint paths computing the rect
     -- a future page is entered on): the view-global use_bbox flag tracks
     -- the *displayed* page, c.f., ReaderZooming:getZoomForPage.
+    -- defer_busy keeps a bbox probe the background worker would race with
+    -- from running on the main thread (deferred → stored/full-page bbox,
+    -- nothing cached). Hint paths pass true: their rect is recomputed by the
+    -- next hint cycle once the worker is idle. Active-view callers leave it
+    -- unset — the page's bbox is already cached there by the zoom decision
+    -- that ran immediately before (with defer_busy=false), so no probe, and
+    -- certainly no race, happens.
     local use_bbox = force_use_bbox ~= nil and force_use_bbox or self.use_bbox
     if use_bbox then
-        return self.document:getUsedBBoxDimensions(page, zoom, rotation)
+        return self.document:getUsedBBoxDimensions(page, zoom, rotation, defer_busy)
     else
         return self.document:getPageDimensions(page, zoom, rotation)
     end

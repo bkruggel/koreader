@@ -1264,7 +1264,7 @@ function ReaderPaging:getNextViewHint()
     -- its OWN crop decision: getPageArea's global use_bbox flag tracks the
     -- currently displayed page, which may crop differently than the target.
     local zoom, target_use_bbox = self.ui.zooming:getZoomForPage(target_page)
-    local target_pa = self.view:getPageArea(target_page, zoom, self.view.state.rotation, target_use_bbox)
+    local target_pa = self.view:getPageArea(target_page, zoom, self.view.state.rotation, target_use_bbox, true)
     -- The viewport _gotoPage lands on, exactly as ReaderView:recalculate
     -- anchors it: viewport-sized (footer-aware), at the right edge for RTL,
     -- at the bottom when configurable.zoom_direction is 2-5, then clamped

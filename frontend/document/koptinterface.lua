@@ -22,6 +22,12 @@ local PerfProfile = require("perfprofile")
 
 require "ffi/posix_h"
 
+-- Minimum fraction of the native page an auto-probed bbox must cover along
+-- BOTH axes before it may replace the stored/manual bounds (c.f.
+-- ReaderZooming's CROP_MIN_AXIS_FRACTION, which applies the same rule at the
+-- zoom-decision level for trim_page == 1).
+local SEMIAUTO_MIN_AXIS_FRACTION = 0.15
+
 local KoptInterface = {
     ocrengine = "ocrengine",
     -- If `$TESSDATA_PREFIX` is set, don't override it: let libk2pdfopt honor it
@@ -228,12 +234,24 @@ function KoptInterface:getAutoBBox(doc, pageno, defer_busy)
         -- evaluation, nothing is cached, and the next zoom evaluation of
         -- this page retries (the worker is idle by then in the common case,
         -- since hint jobs are aborted/coalesced around user interactions).
+        local pdf = require("ffi/mupdf")
         if defer_busy then
-            local pdf = require("ffi/mupdf")
             if pdf.workerStatus() == pdf.WORKER_RUNNING then
                 PerfProfile.log("BBOX_PROBE_DEFERRED page=%d", pageno)
                 return Document.getPageBBox(doc, pageno)
             end
+        elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
+            -- The caller cannot retry later (active-page zoom decision,
+            -- reflow pipeline): it would have raced the background
+            -- rasterization job with openPage + getPagePix here. Cancel the
+            -- job instead and wait until the worker has actually stopped —
+            -- the cooperative abort lands at the next render/saturation
+            -- checkpoint, so this blocks for milliseconds, not seconds
+            -- (round 3.8). The stale job's bookkeeping is released by its
+            -- own poller on the next UIManager tick.
+            PerfProfile.log("BBOX_PROBE_CANCEL_WORKER page=%d", pageno)
+            pdf.workerAbort()
+            pdf.workerWait(-1)
         end
         local perf_t0 = PerfProfile.enabled and PerfProfile.now()
         local page = doc._document:openPage(pageno)
@@ -274,14 +292,18 @@ function KoptInterface:getSemiAutoBBox(doc, pageno, defer_busy)
     local hash = table.concat(hash_list, "|")
     local cached = DocCache:check(hash)
     if not cached then
-        -- Same worker-race deferral as getAutoBBox above; the user's
+        -- Same worker-race handling as getAutoBBox above; the user's
         -- restricted bbox is the fallback until the probe can run.
+        local pdf = require("ffi/mupdf")
         if defer_busy then
-            local pdf = require("ffi/mupdf")
             if pdf.workerStatus() == pdf.WORKER_RUNNING then
                 PerfProfile.log("SEMIAUTO_PROBE_DEFERRED page=%d", pageno)
                 return bbox
             end
+        elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
+            PerfProfile.log("SEMIAUTO_PROBE_CANCEL_WORKER page=%d", pageno)
+            pdf.workerAbort()
+            pdf.workerWait(-1)
         end
         local page = doc._document:openPage(pageno)
         local kc = self:createContext(doc, pageno, bbox)
@@ -294,7 +316,15 @@ function KoptInterface:getSemiAutoBBox(doc, pageno, defer_busy)
         auto_bbox.y1 = auto_bbox.y1 + bbox.y0
         logger.dbg("Semi-auto detected bbox", auto_bbox)
         local native_size = Document.getNativePageDimensions(doc, pageno)
-        if (auto_bbox.x1 - auto_bbox.x0)/native_size.w < 0.1 and (auto_bbox.y1 - auto_bbox.y0)/native_size.h < 0.1 then
+        -- The probed box must fill a meaningful part of the page along BOTH
+        -- axes before it may narrow the user's manual bounds — the same
+        -- per-axis rule as ReaderZooming's CROP_MIN_AXIS_FRACTION (0.15).
+        -- Accepting on a single axis (the old 0.1 `or`) magnified thin
+        -- banners on sparse pages (a 88% x 8% title strip passed via width
+        -- alone, rendering the page as a 100px band) (round 3.8). A probe
+        -- that fails this falls back to the manual box the user drew.
+        if (auto_bbox.x1 - auto_bbox.x0)/native_size.w < SEMIAUTO_MIN_AXIS_FRACTION
+            or (auto_bbox.y1 - auto_bbox.y0)/native_size.h < SEMIAUTO_MIN_AXIS_FRACTION then
             logger.dbg("Semi-auto detected bbox too small, using manual bbox")
             auto_bbox = bbox
         end
