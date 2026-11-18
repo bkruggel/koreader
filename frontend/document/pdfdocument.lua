@@ -706,12 +706,17 @@ function PdfDocument:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturati
         return false
     end
 
-    -- The CTM is a plain scale (plus rotation): the pixmap bbox below already
-    -- anchors the render at (size_x, size_y) in device space, exactly like the
-    -- synchronous path (c.f., page:draw_new's bbox + untransimated ctm).
-    -- Translating here as well double-counts the excerpt origin and shifts
-    -- every rect-anchored worker tile by that origin (visible as content drawn
-    -- offset to the right and cut at the screen edge on ink-offset pages).
+    -- The raster matrix mirrors the synchronous path's draw_new() exactly:
+    -- a plain scale (plus rotation) with NO translate — the excerpt origin
+    -- is carried by the pixmap bbox alone (fz_new_pixmap_with_bbox_and_data
+    -- sets pix->x/y = bbox.x0/y0, so device coords map to pixels as
+    -- (device - origin)). The synchronous path does the same: its DrawContext
+    -- offsets are only ever set for (never-exercised) document rotation,
+    -- while the bbox anchors the render at (size_x, size_y).
+    -- The worker's draw device must likewise stay IDENTITY (c.f.,
+    -- mupdf_worker.c): passing the matrix there as well double-applies it —
+    -- content lands at native*zoom² and is culled/clipped out for any job
+    -- whose bbox doesn't start at (0,0), rendering blank tiles.
     local ctm = pdf.makeCTM(zoom, rotation, 0, 0)
     local bbox = ffi.new("fz_irect", size_x, size_y, size_x + size.w, size_y + size.h)
     local scissor = ffi.new("fz_rect", size_x, size_y, size_x + size.w, size_y + size.h)
