@@ -425,17 +425,12 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
     -- If rect contains a nested scaled_rect object, our caller handled scaling itself (e.g., drawPagePart)
     local is_prescaled = rect and rect.scaled_rect ~= nil or false
 
-    -- Phase 4: before doing any synchronous work, resolve against a possibly
-    -- in-flight background hint (commit it, or skip work it already covers).
-    -- Prescaled fragment requests never match a hint, and aborting the job
-    -- for them would be counter-productive, so they bypass this entirely.
-    if not is_prescaled and self.resolveInFlightHint then
-        local resolved = self:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, saturation, hinting)
-        if resolved == "covered" then
-            return
-        end
-        -- "committed" falls through: the job's tile is now in the cache and
-        -- the lookups below will hit it.
+    -- Phase 4a: commit or release a worker job whose state already settled
+    -- (completion can lag the 20 ms poller by a tick) so the lookups below
+    -- can hit the tile it produced (round 3.9). Prescaled fragment requests
+    -- bypass the async engine entirely.
+    if not is_prescaled and self._drainFinishedWorker then
+        self:_drainFinishedWorker()
     end
 
     local hash, hash_excerpt, tile
@@ -452,8 +447,36 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
         if not tile and rect then
             hash_excerpt = hash.."|"..tostring(rect)
             tile = DocCache:check(hash_excerpt)
-            if not tile then
-                PerfProfile.log("EXCERPT_MISS page=%d rect=%s hash=%s", pageno, tostring(rect), hash_excerpt)
+        end
+    end
+    if tile then
+        if self.tile_cache_validity_ts then
+            if tile.created_ts and tile.created_ts >= self.tile_cache_validity_ts then
+                return tile
+            end
+            logger.dbg("discarding stale cached tile")
+        else
+            return tile
+        end
+    end
+
+    -- Phase 4b: cache miss — only NOW resolve against a possibly in-flight
+    -- background hint (coalesce with it, or cancel it when it renders an
+    -- obsolete target). This used to run before the cache lookups, which
+    -- made every paint whose tile was ALREADY cached abort an in-flight
+    -- hint for a *future* view (e.g. the next pan segment, just dispatched
+    -- by the previous cycle) and block on the cancellation — before
+    -- immediately finding the tile one line later (round 3.9).
+    if not is_prescaled and self.resolveInFlightHint then
+        local resolved = self:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, saturation, hinting)
+        if resolved == "covered" then
+            return
+        end
+        if resolved == "committed" then
+            -- The coalesced job just landed its tile: re-run the lookups.
+            tile = DocCache:check(hash, TileCacheItem)
+            if not tile and hash_excerpt then
+                tile = DocCache:check(hash_excerpt)
             end
         end
     end
@@ -466,6 +489,9 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
         else
             return tile
         end
+    end
+    if not is_prescaled and rect and hash_excerpt then
+        PerfProfile.log("EXCERPT_MISS page=%d rect=%s hash=%s", pageno, tostring(rect), hash_excerpt)
     end
 
     if hinting then

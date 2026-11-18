@@ -19,13 +19,24 @@ function ReaderHinting:onHintPage(_, opportunistic)
     -- params: the bbox probes it needs would either defer (answering with the
     -- stored/full-page bbox → a zoom/rect pair the next paint can never
     -- request) or race the running job (openPage on the main thread while it
-    -- rasterizes). Skip the whole cycle: the paint always resolves the
-    -- in-flight job (coalesce or abort), so the post-paint cycle re-fires
-    -- with the worker idle (round 3.8).
+    -- rasterizes). A paint whose tile was cached returns before resolving
+    -- the in-flight job, so this legitimately happens; when the running job
+    -- targets a superseded view, cancel it and proceed right away — when it
+    -- is still the likely next view, retry the cycle once the worker
+    -- settles instead of leaving the new view unhinted (round 3.9).
     if pdf.workerStatus() == pdf.WORKER_RUNNING then
-        PerfProfile.log("HINT_CYCLE_SKIPPED_BUSY opportunistic=%s",
-            tostring(opportunistic))
-        return true
+        local doc = self.document
+        if doc._in_flight_job and doc._jobStillRelevant
+                and not doc:_jobStillRelevant(doc._in_flight_job) then
+            PerfProfile.log("HINT_CYCLE_CANCELLED_STALE_JOB page=%d",
+                doc._in_flight_job.pageno)
+            doc:_abortInFlightJob()
+        else
+            PerfProfile.log("HINT_CYCLE_DEFERRED_BUSY opportunistic=%s",
+                tostring(opportunistic))
+            self:_scheduleHintRetry(opportunistic)
+            return true
+        end
     end
     -- Ask the paging module what the next interaction in the active reading
     -- direction would display: a pan segment on the current page (including
@@ -62,15 +73,20 @@ function ReaderHinting:onHintPage(_, opportunistic)
             { pageno = predicted.page, rect = predicted.rect,
               zoom = zoom, use_bbox = use_bbox },
         }
-        -- Any remaining hint slots (DHINTCOUNT > 1) target the following
-        -- pages at their forward entry edge.
+        -- Any remaining hint slots (DHINTCOUNT > 1) continue from the
+        -- predicted view along the active reading direction: after an
+        -- intra-page pan on page N they prefetch N+1, N+2 (the old
+        -- state.page + i skipped N+1), and after a backward prediction
+        -- (N-1) they prefetch N-2, N-3 at their bottom edges (the old loop
+        -- hardcoded the forward direction) (round 3.9).
+        local dir = (self.ui.paging and self.ui.paging.last_view_rel_diff) or 1
         for i = 2, DHINTCOUNT do
-            local pageno = self.view.state.page + i
-            if pageno <= self.document.info.number_of_pages then
+            local pageno = predicted.page + (dir > 0 and (i - 1) or -(i - 1))
+            if pageno >= 1 and pageno <= self.document.info.number_of_pages then
                 local z, ub = self.zoom:getZoomForPage(pageno)
                 slots[#slots + 1] = {
                     pageno = pageno,
-                    rect = self:getEntryEdgeRect(pageno, 1, z, ub),
+                    rect = self:getEntryEdgeRect(pageno, dir, z, ub),
                     zoom = z, use_bbox = ub,
                 }
             end
@@ -120,6 +136,43 @@ function ReaderHinting:_dispatchHintSlots(slots, opportunistic)
             slot.rect,
             (i > 1 or opportunistic) and true or nil,
             slot.use_bbox)
+    end
+end
+
+--- Re-fire a hint cycle that found the worker busy: poll the worker state
+-- on the UIManager loop until it settles (a commit, an abort or a failure
+-- all idle it), then run the cycle against the current view state. Capped,
+-- so a pathologically long job cannot pin timers forever — the next paint
+-- re-fires the cycle anyway (round 3.9). The pending closure is tracked so
+-- onCloseDocument can unschedule it: a retry firing into a closed document
+-- would re-enter onHintPage and hit freed MuPDF state through FFI
+-- (observed as a segfault during UIManager teardown under a busy worker).
+function ReaderHinting:_scheduleHintRetry(opportunistic, attempt)
+    attempt = (attempt or 0) + 1
+    if attempt > 250 then
+        return
+    end
+    if self._hint_retry_fn then
+        UIManager:unschedule(self._hint_retry_fn)
+    end
+    self._hint_retry_fn = function()
+        self._hint_retry_fn = nil
+        if not self.ui or not self.view or not self.view.hinting then
+            return
+        end
+        if pdf.workerStatus() == pdf.WORKER_RUNNING then
+            self:_scheduleHintRetry(opportunistic, attempt)
+            return
+        end
+        self:onHintPage(nil, opportunistic)
+    end
+    UIManager:scheduleIn(0.02, self._hint_retry_fn)
+end
+
+function ReaderHinting:onCloseDocument()
+    if self._hint_retry_fn then
+        UIManager:unschedule(self._hint_retry_fn)
+        self._hint_retry_fn = nil
     end
 end
 

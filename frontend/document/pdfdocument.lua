@@ -636,6 +636,9 @@ function PdfDocument:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturati
     if not self:_ensureWorker() then
         return false
     end
+    -- A job may have settled since the last poll tick: commit its tile (or
+    -- release its bookkeeping) before treating _in_flight_job as "busy".
+    self:_drainFinishedWorker()
     if self._in_flight_job then
         if dispatch_only then
             -- Opportunistic re-hint while the worker is busy: park it
@@ -777,6 +780,29 @@ function PdfDocument:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturati
     return true
 end
 
+--- Commit or release a job whose worker state already settled but whose
+-- bookkeeping still lingers: completion polling runs on a 20 ms UIManager
+-- timer, so workerStatus() can already report WORKER_DONE / WORKER_ABORTED
+-- / WORKER_ERROR while _in_flight_job is still set (and a direct abort,
+-- c.f. KoptInterface's probe cancellation, lands without any poller tick at
+-- all). Every worker-state inspection that gates a decision — dispatching a
+-- new hint, resolving against a paint, cancelling a job — must drain first,
+-- or it would treat a finished job as busy (and e.g. throw away a completed
+-- WORKER_DONE tile without committing it) (round 3.9).
+function PdfDocument:_drainFinishedWorker()
+    if not self._in_flight_job then
+        return
+    end
+    local status = pdf.workerStatus()
+    if status == pdf.WORKER_DONE then
+        self:_commitInFlightJob()
+    elseif status ~= pdf.WORKER_RUNNING then
+        self._in_flight_job = nil
+        self._in_flight_poll = nil
+        CanvasContext:enableCPUCores(1)
+    end
+end
+
 --- Commit a completed in-flight job to the tile cache. Gamma and saturation
 -- were already applied by the worker (c.f., mupdf_worker.c).
 function PdfDocument:_commitInFlightJob()
@@ -826,6 +852,10 @@ end
 -- it (round 3.8). Returning only when the worker is idle makes every
 -- _abortInFlightJob caller safe by construction.
 function PdfDocument:_abortInFlightJob()
+    -- Drain first: a job that already finished must be COMMITTED, not
+    -- discarded under a cancel (its tile is perfectly valid), and a job
+    -- whose abort already landed only needs its bookkeeping released.
+    self:_drainFinishedWorker()
     local job = self._in_flight_job
     if not job then
         return
@@ -846,6 +876,9 @@ end
 -- exactly this request (only safe for hinting callers, which may skip),
 -- or nil when the caller must render synchronously.
 function PdfDocument:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, saturation, hinting)
+    -- A settled job must be committed (or released) before same_target is
+    -- judged against it (round 3.9).
+    self:_drainFinishedWorker()
     local job = self._in_flight_job
     if not job then
         return nil

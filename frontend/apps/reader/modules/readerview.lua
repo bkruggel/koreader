@@ -119,13 +119,12 @@ function ReaderView:init()
     self.emitHintPageEvent = function()
         self.ui:handleEvent(Event:new("HintPage", self.hinting))
     end
-    -- Opportunistic variant fired right after an intra-page pan update (see
-    -- PanningUpdate): dispatches a hint for the next view without ever
-    -- falling back to a synchronous render (the paint that follows this pan
-    -- remains the authoritative hinting point).
-    self.emitOpportunisticHintEvent = function()
-        self.ui:handleEvent(Event:new("HintPage", self.hinting, true))
-    end
+    -- (The opportunistic pre-paint variant this used to coexist with was
+    -- removed in round 3.9: it ran BEFORE the pan's repaint — nextTick
+    -- tasks execute before _repaint — probing and dispatching the next
+    -- segment's hint at the cost of delaying the paint the user is waiting
+    -- for. Every paint schedules emitHintPageEvent on completion, which is
+    -- the authoritative, post-paint hint point.)
 
     -- We've subclassed OverlapGroup, go through its init, because it does some funky stuff with self.dimen...
     OverlapGroup.init(self)
@@ -859,14 +858,11 @@ function ReaderView:PanningUpdate(dx, dy)
     if self.visible_area ~= old then
         -- flag a repaint
         UIManager:setDirty(self.dialog, "partial")
-        -- Re-hint after every intra-page pan: zoomed multi-segment views
-        -- (e.g. 2-column navigation) take several pans per page, and each
-        -- upcoming segment must be pre-rendered while the current one is
-        -- read. The dispatch is opportunistic (no synchronous fallback), so
-        -- it can't disturb an in-flight job; if the worker is busy, the
-        -- paint-anchored hint event for this same pan will handle it once
-        -- the repaint has settled.
-        UIManager:nextTick(self.emitOpportunisticHintEvent)
+        -- Re-hinting after intra-page pans is handled by the paint itself:
+        -- drawSinglePage schedules emitHintPageEvent on completion, which
+        -- predicts and dispatches the next segment AFTER the user's paint,
+        -- not before it (the pre-paint opportunistic dispatch this used to
+        -- race with was removed in round 3.9).
         logger.dbg("on pan: page_area", self.page_area)
         logger.dbg("on pan: visible_area", self.visible_area)
         self.ui:handleEvent(
@@ -1310,11 +1306,9 @@ end
 function ReaderView:onCloseWidget()
     -- Stop any pending HintPage event
     UIManager:unschedule(self.emitHintPageEvent)
-    UIManager:unschedule(self.emitOpportunisticHintEvent)
     --- @fixme: The awful readerhighlight_spec test *relies* on this pointer being left dangling...
     if not self.ui._testsuite then
         self.emitHintPageEvent = nil
-        self.emitOpportunisticHintEvent = nil
     end
 end
 

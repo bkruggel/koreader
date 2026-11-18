@@ -252,6 +252,13 @@ function KoptInterface:getAutoBBox(doc, pageno, defer_busy)
             PerfProfile.log("BBOX_PROBE_CANCEL_WORKER page=%d", pageno)
             pdf.workerAbort()
             pdf.workerWait(-1)
+            -- The abort landed without any poller tick: release the stale
+            -- job's bookkeeping now (or commit it, if it had already
+            -- finished before our cancel), so later worker-state checks
+            -- don't treat the idle worker as busy (round 3.9).
+            if doc._drainFinishedWorker then
+                doc:_drainFinishedWorker()
+            end
         end
         local perf_t0 = PerfProfile.enabled and PerfProfile.now()
         local page = doc._document:openPage(pageno)
@@ -304,6 +311,9 @@ function KoptInterface:getSemiAutoBBox(doc, pageno, defer_busy)
             PerfProfile.log("SEMIAUTO_PROBE_CANCEL_WORKER page=%d", pageno)
             pdf.workerAbort()
             pdf.workerWait(-1)
+            if doc._drainFinishedWorker then
+                doc:_drainFinishedWorker()
+            end
         end
         local page = doc._document:openPage(pageno)
         local kc = self:createContext(doc, pageno, bbox)
