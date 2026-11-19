@@ -324,12 +324,7 @@ local reader_retval = exitReader()
 -- Apply exit user patches and execute user scripts
 userpatch.applyPatches(userpatch.on_exit)
 
--- Shut the async rasterization worker down (cooperative abort + join +
--- drop of its context) BEFORE the Lua state is finalized below: its thread
--- is otherwise still alive while LuaJIT's finalizers release the MuPDF
--- objects it holds references to (display lists, the shared lock state),
--- which segfaults the process intermittently at exit when a job was still
--- in flight (round 3.9). Only touch ffi/mupdf if it was loaded this session.
+-- Stop the background MuPDF rasterization worker before LuaJIT finalizers tear down the context.
 pcall(function()
     local pdf = package.loaded["ffi/mupdf"]
     if pdf and pdf.workerShutdown then

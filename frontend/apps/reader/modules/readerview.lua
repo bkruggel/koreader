@@ -118,12 +118,6 @@ function ReaderView:init()
     self.emitHintPageEvent = function()
         self.ui:handleEvent(Event:new("HintPage", self.hinting))
     end
-    -- (The opportunistic pre-paint variant this used to coexist with was
-    -- removed in round 3.9: it ran BEFORE the pan's repaint — nextTick
-    -- tasks execute before _repaint — probing and dispatching the next
-    -- segment's hint at the cost of delaying the paint the user is waiting
-    -- for. Every paint schedules emitHintPageEvent on completion, which is
-    -- the authoritative, post-paint hint point.)
 
     -- We've subclassed OverlapGroup, go through its init, because it does some funky stuff with self.dimen...
     OverlapGroup.init(self)
@@ -752,18 +746,10 @@ function ReaderView:drawHighlightRect(bb, _x, _y, rect, drawer, color, draw_note
     end
 end
 
+--- Compute the scaled page area for `page`.
+-- @tparam[opt] bool force_use_bbox override `self.use_bbox` when evaluating a non-displayed page
+-- @tparam[opt] bool defer_busy defer uncached bbox probes while the background worker is running
 function ReaderView:getPageArea(page, zoom, rotation, force_use_bbox, defer_busy)
-    -- force_use_bbox lets callers evaluate a page other than the displayed
-    -- one with that page's own crop decision (hint paths computing the rect
-    -- a future page is entered on): the view-global use_bbox flag tracks
-    -- the *displayed* page, c.f., ReaderZooming:getZoomForPage.
-    -- defer_busy keeps a bbox probe the background worker would race with
-    -- from running on the main thread (deferred → stored/full-page bbox,
-    -- nothing cached). Hint paths pass true: their rect is recomputed by the
-    -- next hint cycle once the worker is idle. Active-view callers leave it
-    -- unset — the page's bbox is already cached there by the zoom decision
-    -- that ran immediately before (with defer_busy=false), so no probe, and
-    -- certainly no race, happens.
     local use_bbox = force_use_bbox ~= nil and force_use_bbox or self.use_bbox
     if use_bbox then
         return self.document:getUsedBBoxDimensions(page, zoom, rotation, defer_busy)
@@ -841,11 +827,6 @@ function ReaderView:PanningUpdate(dx, dy)
     if self.visible_area ~= old then
         -- flag a repaint
         UIManager:setDirty(self.dialog, "partial")
-        -- Re-hinting after intra-page pans is handled by the paint itself:
-        -- drawSinglePage schedules emitHintPageEvent on completion, which
-        -- predicts and dispatches the next segment AFTER the user's paint,
-        -- not before it (the pre-paint opportunistic dispatch this used to
-        -- race with was removed in round 3.9).
         logger.dbg("on pan: page_area", self.page_area)
         logger.dbg("on pan: visible_area", self.visible_area)
         self.ui:handleEvent(

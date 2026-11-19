@@ -521,27 +521,15 @@ function ReaderZooming:onExitFlippingMode(zoom_mode)
     self.ui:handleEvent(Event:new("SetZoomMode", zoom_mode))
 end
 
---- Pure zoom evaluation for `pageno`: computes the zoom the page renders at
--- and whether its probed content bbox governs the view, WITHOUT touching
--- ReaderView state.
--- Hinting paths evaluate *upcoming* pages with this (ReaderPaging:
--- getNextViewHint, ReaderHinting:onHintPage/getEntryEdgeRect, and
--- ReaderHighlight's page-1 scale probe); writing the view-global use_bbox
--- flag from those would make the *displayed* page's next recalculate mix
--- its own zoom with a foreign page's crop decision — the "crop changes
--- when revisited / when panning" bug (round 3.7).
--- @tfield bool defer_busy when true (the default — hint paths evaluate
--- upcoming pages), a bbox probe the background worker would race with is
--- deferred and the stored/full-page bbox answers this evaluation instead
--- (UNCACHED, retried by a later evaluation). The caller evaluating the page
--- actually being displayed (ReaderZooming:getZoom) passes false: the zoom
--- and the page area the view anchors to MUST come from the same, real bbox
--- — a deferred answer here would lock state.zoom at the uncropped zoom
--- while the immediately-following getPageArea call probes and caches the
--- cropped bbox, rendering the page shrunk inside its crop with no retry
--- (round 3.8). With defer_busy=false the probe site cancels the worker
--- instead of racing it (c.f., KoptInterface:getAutoBBox).
--- @return zoom, use_bbox (whether the page's content bbox governs the view)
+--- Pure zoom evaluation for `pageno` without mutating `ReaderView` state.
+-- Hinting paths evaluate upcoming pages with this so they do not overwrite
+-- `view.use_bbox` for the currently displayed page.
+-- @tparam int pageno
+-- @tparam[opt=true] bool defer_busy defer uncached bbox probes while the background worker is running
+-- @treturn number zoom
+-- @treturn bool use_bbox whether the page's content bbox governs the view
+-- @treturn number zoom_w
+-- @treturn number zoom_h
 function ReaderZooming:getZoomForPage(pageno, defer_busy)
     if defer_busy == nil then
         defer_busy = true
@@ -613,14 +601,7 @@ function ReaderZooming:getZoomForPage(pageno, defer_busy)
     return zoom, use_bbox, zoom_w, zoom_h
 end
 
---- The zoom the given page renders at. Applies the page's crop decision to
--- the view — but ONLY when evaluating the page actually being displayed:
--- hinting paths run this for upcoming pages constantly (every turn, and
--- after every intra-page pan via the opportunistic hint cycle), and a use_bbox
--- flip from one of those would corrupt the next recalculate of the *current*
--- view (its zoom combined with a foreign page's crop decision). Callers that
--- evaluate a foreign page (or want the decision without view side effects)
--- use getZoomForPage directly.
+--- Compute zoom for `pageno` and update `view.use_bbox` when evaluating the displayed page.
 function ReaderZooming:getZoom(pageno)
     local zoom, use_bbox, zoom_w, zoom_h = self:getZoomForPage(pageno, false)
     if self.view.state.page == nil or pageno == self.view.state.page then
