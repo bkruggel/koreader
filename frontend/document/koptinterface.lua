@@ -219,14 +219,8 @@ function KoptInterface:getAutoBBox(doc, pageno, defer_busy)
     local hash = table.concat(hash_list, "|")
     local cached = DocCache:check(hash)
     if not cached then
-        -- The probe below renders the page on the main thread (openPage +
-        -- getPagePix). While the background rasterization worker is running
-        -- a job, that is two page-consuming MuPDF operations in flight at
-        -- once — a race we must not enter. Deferring costs little here: the
-        -- caller falls back to the stored/full-page bbox for this
-        -- evaluation, nothing is cached, and the next zoom evaluation of
-        -- this page retries (the worker is idle by then in the common case,
-        -- since hint jobs are aborted/coalesced around user interactions).
+        -- Avoid racing a running MuPDF worker: defer non-critical hint probes,
+        -- or cancel the worker when the caller needs an immediate result.
         local pdf = doc.is_pdf and package.loaded["ffi/mupdf"]
         if pdf then
             if defer_busy then
@@ -234,10 +228,6 @@ function KoptInterface:getAutoBBox(doc, pageno, defer_busy)
                     return Document.getPageBBox(doc, pageno)
                 end
             elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
-                -- The caller cannot retry later (active-page zoom decision,
-                -- reflow pipeline): cancel the worker and wait until it has
-                -- stopped without launching any parked _pending_hint so the
-                -- worker stays idle across openPage + getPagePix below.
                 if doc._abortInFlightJob then
                     doc:_abortInFlightJob()
                 end
@@ -277,8 +267,6 @@ function KoptInterface:getSemiAutoBBox(doc, pageno, defer_busy)
     local hash = table.concat(hash_list, "|")
     local cached = DocCache:check(hash)
     if not cached then
-        -- Same worker-race handling as getAutoBBox above; the user's
-        -- restricted bbox is the fallback until the probe can run.
         local pdf = doc.is_pdf and package.loaded["ffi/mupdf"]
         if pdf then
             if defer_busy then

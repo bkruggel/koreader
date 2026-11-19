@@ -573,9 +573,7 @@ function ReaderPaging:onGotoPercent(percent)
 end
 
 function ReaderPaging:onGotoViewRel(diff, no_page_turn)
-    -- Remember the direction of the last relative view change: hinting uses
-    -- it as the "active reading direction" to predict what the next
-    -- interaction will display (c.f., ReaderPaging:getNextViewHint).
+    -- Track the active reading direction so hinting can predict the next view.
     if diff ~= 0 then
         self.last_view_rel_diff = diff > 0 and 1 or -1
     end
@@ -1132,21 +1130,12 @@ function ReaderPaging:onGotoPageRel(diff, no_page_turn)
     return true
 end
 
---- Predict, read-only, what the next relative view change in the active
--- reading direction would display, so background hinting can render exactly
--- what the next paint will request. This mirrors the decision tree of
--- onGotoPageRel (pan within the page, pan to the line end, next line/column,
--- or turn) *including* its direction adjustments — the axis inversion for
--- zoom_direction_vertical (2D column navigation through multi-column pages),
--- right-to-left and bottom-to-top flows — without applying any of it.
--- @return {page, rect} for the next view, or nil when it cannot be
--- predicted (scroll mode or free zoom: those keep the legacy hinting
--- behavior).
+--- Predict the next `{ page, rect, use_bbox }` view along `last_view_rel_diff`
+-- by mirroring `onGotoPageRel` read-only (including axis swaps for vertical
+-- column navigation, RTL, and bottom-to-top flows).
+-- @treturn[opt] table `{ page = int, rect = Geom, use_bbox = bool }` or nil
 function ReaderPaging:getNextViewHint()
-    if self.view.page_scroll then
-        return nil
-    end
-    if self.zoom_mode == "free" then
+    if self.view.page_scroll or self.zoom_mode == "free" then
         return nil
     end
     local va = self.visible_area
@@ -1156,12 +1145,6 @@ function ReaderPaging:getNextViewHint()
     end
     local diff = self.last_view_rel_diff or 1
 
-    -- Direction adjustments, verbatim from onGotoPageRel: the state machine
-    -- below is generic over the (possibly swapped) axis variables, so
-    -- running the identical block keeps the prediction faithful for every
-    -- reading direction. With zoom_direction_vertical, "line" means column:
-    -- intra-column steps pan vertically, the wrap moves one column across
-    -- and back to the top, and a page turn resets both axes.
     local right_to_left = self.ui.document.configurable.writing_direction
         and self.ui.document.configurable.writing_direction > 0
     local bottom_to_top = self.ui.zooming.zoom_bottom_to_top
@@ -1192,8 +1175,6 @@ function ReaderPaging:getNextViewHint()
 
     local new_va = { x = va.x, y = va.y, w = va.w, h = va.h }
     local function at_end(axis)
-        -- returns true if we're at the end of the line/column (axis = x)
-        -- or page (axis = y)
         local len, _diff
         if axis == x then
             len, _diff = w, x_diff
@@ -1210,17 +1191,12 @@ function ReaderPaging:getNextViewHint()
                     and va[axis] + pa[len] - va[len]
                     or pa[axis]
     end
-    -- The applied pan goes through ReaderView:PanningUpdate, which offsets
-    -- the view and clamps it back inside the page; replicate that clamp so
-    -- the predicted rect matches what the paint will request.
     local function panned_rect()
         local rect = Geom:new(new_va)
         rect:offsetWithin(pa, 0, 0)
         return rect
     end
 
-    -- Move the view area towards line/column end, then handle page boundary
-    -- cases exactly like onGotoPageRel does.
     new_va[x] = va[x] + x_pan_off
     if pa:contains(new_va) then
         return { page = self.current_page, rect = panned_rect() }
@@ -1229,9 +1205,6 @@ function ReaderPaging:getNextViewHint()
         goto_end(x)
         return { page = self.current_page, rect = panned_rect() }
     end
-    -- goto_next_line(): wrap to the start edge of the x axis and one
-    -- viewport step along the y axis (next line, or next column when the
-    -- axes are inverted for column navigation).
     new_va[y] = va[y] + y_pan_off
     goto_end(x, -x_diff)
     if pa:contains(new_va) then
@@ -1242,11 +1215,6 @@ function ReaderPaging:getNextViewHint()
         return { page = self.current_page, rect = panned_rect() }
     end
 
-    -- The next interaction turns the page: the target page is entered with
-    -- *both* axes reset (goto_end(y, -y_diff) and goto_end(x, -x_diff) after
-    -- the _gotoPage in goto_next_page) to its entry corner — top-left for
-    -- forward turns, bottom-right for backward ones, per reading direction —
-    -- instead of carrying over any pan offset from the current column.
     local target_page
     if self.ui.document:hasHiddenFlows() then
         target_page = diff > 0 and self.ui.document:getNextPage(self.current_page)
@@ -1258,17 +1226,11 @@ function ReaderPaging:getNextViewHint()
         target_page = self.current_page + diff
     end
     if target_page < 1 or target_page > self.number_of_pages then
-        return nil -- end of book: nothing meaningful to hint
+        return nil
     end
-    -- Evaluate the target page purely (no view-state side effects) and with
-    -- its OWN crop decision: getPageArea's global use_bbox flag tracks the
-    -- currently displayed page, which may crop differently than the target.
+
     local zoom, target_use_bbox = self.ui.zooming:getZoomForPage(target_page)
     local target_pa = self.view:getPageArea(target_page, zoom, self.view.state.rotation, target_use_bbox, true)
-    -- The viewport _gotoPage lands on, exactly as ReaderView:recalculate
-    -- anchors it: viewport-sized (footer-aware), at the right edge for RTL,
-    -- at the bottom when configurable.zoom_direction is 2-5, then clamped
-    -- inside the page.
     local fresh = Geom:new{
         x = target_pa.x,
         y = target_pa.y,
@@ -1279,12 +1241,6 @@ function ReaderPaging:getNextViewHint()
             and not self.view.footer.settings.reclaim_height then
         fresh.h = fresh.h - self.view.footer:getHeight()
     end
-    -- A cropped page may be smaller than the viewport on either axis: clamp
-    -- the entry viewport to the page area, exactly like ReaderHinting:
-    -- getEntryEdgeRect does — offsetWithin below only shifts the origin, so
-    -- an unclamped size would make the predicted rect differ from what
-    -- ReaderView:recalculate requests after the turn (guaranteed
-    -- EXCERPT_MISS, i.e., a cold paint on every turn to such a page).
     if fresh.w > target_pa.w then
         fresh.w = target_pa.w
     end
@@ -1299,8 +1255,7 @@ function ReaderPaging:getNextViewHint()
         fresh.y = target_pa.y + target_pa.h - fresh.h
     end
     fresh:offsetWithin(target_pa, 0, 0)
-    -- goto_end(x, -x_diff) and goto_end(y, -y_diff) on the target page,
-    -- then the same PanningUpdate clamp.
+
     local entry = fresh:copy()
     local function goto_entry_end(axis, _diff)
         local len = axis == x and w or h
@@ -1340,8 +1295,7 @@ function ReaderPaging:_gotoPage(number, orig_mode)
 end
 
 function ReaderPaging:onGotoPage(number, pos)
-    -- Absolute jumps (TOC, bookmarks, links...) enter the page at its top:
-    -- reset the assumed reading direction accordingly.
+    -- Reset assumed reading direction on absolute jumps (TOC, bookmarks, links).
     self.last_view_rel_diff = 1
     self:setPagePosition(number, 0)
     self:_gotoPage(number)
