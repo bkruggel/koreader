@@ -8,27 +8,10 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local SpinWidget = require("ui/widget/spinwidget")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local PerfProfile = require("perfprofile")
 local _ = require("gettext")
 local Input = Device.input
 local Screen = Device.screen
 local T = require("ffi/util").template
-
--- Auto-crop (trim_page == 1) must never crop down to a *degenerate* content
--- area. Sparse pages (title pages, part dividers, chapter openers) can probe
--- an ink bbox that is a thin band of the page — a full-width title banner on
--- this device's test book spans ~88% of the width but ~11% of the height;
--- cropping to it fills the screen with a fragment, which users experience as
--- "the page is cropped" even though the setting is doing what it was told.
--- The probed bbox must span at least this fraction of the page along BOTH
--- axes before auto-crop may use it; smaller bands fall back to fitting the
--- whole page. The check is per-axis, deliberately NOT an area check: a
--- merely *partial* page (a chapter end, ~68% width × ~26% height) is
--- legitimate content and must keep its crop — a 2D area threshold is what
--- made the crop apply to some pages and not others ("crop setting not
--- applied consistently"). Manual (trim_page == 0) and semi-auto (== 2) crop
--- bounds are the user's own choices and are honored as-is.
-local CROP_MIN_AXIS_FRACTION = 0.15
 
 local ReaderZooming = InputContainer:extend{
     zoom = 1.0,
@@ -570,15 +553,7 @@ function ReaderZooming:getZoomForPage(pageno, defer_busy)
         local ubbox_dimen = self.ui.document:getUsedBBoxDimensions(pageno, 1, nil, defer_busy)
         -- if bbox is larger than the native page dimension render the full page
         -- See discussion in koreader/koreader#970.
-        if ubbox_dimen.w <= page_size.w and ubbox_dimen.h <= page_size.h
-            -- ...and, in the auto-detection mode, if it is a meaningful part
-            -- of the page along both axes (c.f. CROP_MIN_AXIS_FRACTION
-            -- above: the band a sparse page probes must not fill the
-            -- screen, but a partial page must not lose its crop either).
-            -- Manual (0) and semi-auto (2) bounds are the user's own.
-            and (self.ui.document.configurable.trim_page ~= 1
-                or (ubbox_dimen.w >= page_size.w * CROP_MIN_AXIS_FRACTION
-                    and ubbox_dimen.h >= page_size.h * CROP_MIN_AXIS_FRACTION)) then
+        if ubbox_dimen.w <= page_size.w and ubbox_dimen.h <= page_size.h then
             page_size = ubbox_dimen
             use_bbox = true
         end
@@ -647,15 +622,6 @@ end
 -- evaluate a foreign page (or want the decision without view side effects)
 -- use getZoomForPage directly.
 function ReaderZooming:getZoom(pageno)
-    -- TEMP DIAGNOSTIC (round 3.5): device flips between cropped/uncropped
-    -- views across recalcs; log the decision inputs on every evaluation.
-    if PerfProfile.enabled then
-        PerfProfile.log("ZOOM_DECISION pageno=%d mode=%s trim=%s factor=%s state_page=%s",
-            pageno, tostring(self.zoom_mode),
-            tostring(self.ui.document.configurable.trim_page),
-            tostring(self.zoom_factor),
-            tostring(self.view.state.page))
-    end
     local zoom, use_bbox, zoom_w, zoom_h = self:getZoomForPage(pageno, false)
     if self.view.state.page == nil or pageno == self.view.state.page then
         self.view:onBBoxUpdate(use_bbox and true or false)
