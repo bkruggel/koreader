@@ -6,7 +6,6 @@ local DocSettings = require("docsettings")
 local Document = require("document/document")
 local DrawContext = require("ffi/drawcontext")
 local logger = require("logger")
-local PerfProfile = require("perfprofile")
 local TileCacheItem = require("document/tilecacheitem")
 local UIManager = require("ui/uimanager")
 local util = require("util")
@@ -606,7 +605,6 @@ function PdfDocument:_queuePendingHint(pageno, rect, zoom, rotation, gamma, satu
     local job = self._in_flight_job
     if _jobMatchesTarget(job, pageno, rect, zoom, rotation, gamma, saturation) then
         -- The running job already renders exactly this target.
-        PerfProfile.log("PENDING_HINT_COVERED page=%d", pageno)
         return
     end
     self._pending_hint = {
@@ -622,12 +620,8 @@ function PdfDocument:_queuePendingHint(pageno, rect, zoom, rotation, gamma, satu
     -- and dispatch the parked hint immediately instead of letting the user
     -- reach the target while its tile still doesn't exist.
     if not self:_jobStillRelevant(job) then
-        PerfProfile.log("PENDING_HINT_ABORT_OBSOLETE job_page=%d new_page=%d",
-            job.pageno, pageno)
         self:_abortInFlightJob()
         self:_dispatchPendingHint()
-    else
-        PerfProfile.log("PENDING_HINT_QUEUED page=%d job_page=%d", pageno, job.pageno)
     end
 end
 
@@ -639,16 +633,10 @@ function PdfDocument:_dispatchPendingHint()
         return
     end
     self._pending_hint = nil
-    PerfProfile.log("PENDING_HINT_DISPATCH page=%d rect=%s",
-        pending.pageno, tostring(pending.rect))
     -- Dispatched with dispatch_only semantics: a dedupe hit (the tile is
     -- already committed) counts as handled, never as a drop.
-    if not self:hintPageAsync(pending.pageno, pending.rect, pending.zoom,
-            pending.rotation, pending.gamma, pending.saturation, true) then
-        -- Rare submit failure on a still-retiring worker: the next
-        -- paint-anchored hint cycle regenerates the prediction anyway.
-        PerfProfile.log("PENDING_HINT_DROPPED page=%d", pending.pageno)
-    end
+    self:hintPageAsync(pending.pageno, pending.rect, pending.zoom,
+        pending.rotation, pending.gamma, pending.saturation, true)
 end
 
 --- Attempt to dispatch a hint to the background worker.
@@ -709,16 +697,9 @@ function PdfDocument:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturati
     --    A cache hit is free; a build parses the content stream (typically
     --    a few ms, noticeably more with embedded images — the reason the
     --    list is cached across a page's viewport slices at all).
-    local perf_dlist = PerfProfile.enabled and PerfProfile.now()
-    local dlist, dl_entry, dl_fresh = self:_getDisplayList(pageno)
+    local dlist, dl_entry = self:_getDisplayList(pageno)
     if not dlist then
         return false
-    end
-    if perf_dlist then
-        PerfProfile.log("DLIST_CACHE state=%s page=%d size=%.0fx%.0f duration=%.2f",
-            dl_fresh and "build" or "hit", pageno,
-            dl_entry.page_bbox.w, dl_entry.page_bbox.h,
-            PerfProfile.now() - perf_dlist)
     end
     local transparency_mask = (self.configurable.background_cleanup or 0) ~= 0
         and dl_entry.has_transparency_mask or false
@@ -796,7 +777,6 @@ function PdfDocument:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturati
         elseif status == pdf.WORKER_DONE then
             self:_commitInFlightJob()
         else -- WORKER_ERROR or WORKER_ABORTED
-            PerfProfile.log("ASYNC_FAIL page=%d status=%d", self._in_flight_job.pageno, status)
             self._in_flight_job = nil
             self._in_flight_poll = nil
             CanvasContext:enableCPUCores(1)
@@ -842,8 +822,6 @@ function PdfDocument:_commitInFlightJob(suppress_dispatch)
         return
     end
 
-    local t0 = PerfProfile.enabled and PerfProfile.now()
-
     local tile = TileCacheItem:new{
         persistent = true,
         doc_path = self.file,
@@ -865,10 +843,6 @@ function PdfDocument:_commitInFlightJob(suppress_dispatch)
     self:_clearPollTimer()
     self._in_flight_job = nil
     CanvasContext:enableCPUCores(1)
-    if t0 then
-        PerfProfile.log("ASYNC_COMMIT_MS page=%d duration=%.2f hash=%s",
-            job.pageno, PerfProfile.now() - t0, job.hash)
-    end
     -- The worker just went idle: run the opportunistic hint parked for
     -- exactly this moment (c.f., _queuePendingHint), unless the caller is
     -- about to use MuPDF on the main thread or dispatch a fresh hint.
@@ -932,7 +906,6 @@ function PdfDocument:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, sa
         end
         -- Synchronous user request: wait out the remaining slice of the
         -- rasterization instead of duplicating it on the main thread.
-        PerfProfile.log("COALESCE page=%d", pageno)
         local status = pdf.workerWait(COALESCE_WAIT_MS)
         if status ~= pdf.WORKER_DONE then
             -- Slow worker (a background core can clock down hard on some
@@ -940,7 +913,6 @@ function PdfDocument:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, sa
             -- Abandon the job (cooperative abort lands at the next
             -- scanline checkpoint) and let the caller render it on the
             -- much-awake main thread instead.
-            PerfProfile.log("COALESCE_TIMEOUT page=%d", pageno)
             self:_abortInFlightJob()
             return nil
         end

@@ -9,7 +9,6 @@ local Math = require("optmath")
 local TileCacheItem = require("document/tilecacheitem")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
-local PerfProfile = require("perfprofile")
 
 --[[
 This is an abstract interface to a document
@@ -491,9 +490,6 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
             return tile
         end
     end
-    if not is_prescaled and rect and hash_excerpt then
-        PerfProfile.log("EXCERPT_MISS page=%d rect=%s hash=%s", pageno, tostring(rect), hash_excerpt)
-    end
 
     if hinting then
         CanvasContext:enableCPUCores(2)
@@ -516,9 +512,6 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
             --- @todo figure out how to better segment the page
             if not rect then
                 logger.warn("No render region was specified, we won't render the page at all!")
-                PerfProfile.log("CACHE_REJECT page=%d size=%dx%d bytes=%d",
-                    pageno, size.w, size.h,
-                    size.w * size.h * (self.render_color and 4 or 1) + 512)
                 -- no rect specified, abort
                 if hinting then
                     CanvasContext:enableCPUCores(1)
@@ -598,7 +591,6 @@ end
 -- job nor block the main thread.
 function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only, use_bbox)
     logger.dbg("hinting page", pageno)
-    local perf_t0 = PerfProfile.enabled and PerfProfile.now()
 
     local rect = nil
     -- When the view crops this page to its content bbox (the zoom was chosen
@@ -667,8 +659,6 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
                 h = math.min(page_size.h, CanvasContext:getHeight()),
             }
         end
-        PerfProfile.log("HINT_VIEWPORT page=%d full=%dx%d rect=%d,%d,%dx%d reason=%s",
-            pageno, page_size.w, page_size.h, rect.x, rect.y, rect.w, rect.h, reason)
     end
 
     -- Phase 4: prefer the background worker (dispatch is a few ms of display
@@ -678,21 +668,14 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
     -- in-flight job instead of duplicating it. (Backends with async support
     -- handle dispatch_only internally by parking the hint while busy.)
     if self.hintPageAsync and self:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturation, dispatch_only) then
-        if perf_t0 then
-            PerfProfile.log("HINT_DISPATCH_MS page=%d duration=%.2f", pageno, PerfProfile.now() - perf_t0)
-        end
         return
     end
 
     if dispatch_only then
-        PerfProfile.log("HINT_SKIP_BUSY page=%d", pageno)
         return
     end
 
     self:renderPage(pageno, rect, zoom, rotation, gamma, saturation, true)
-    if perf_t0 then
-        PerfProfile.log("HINT_BLOCK_MS page=%d duration=%.2f", pageno, PerfProfile.now() - perf_t0)
-    end
 end
 
 function Document:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturation)
@@ -706,8 +689,6 @@ function Document:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturat
         rotation = rotation, gamma = gamma, saturation = saturation,
     }
     if self._pending_hint then
-        PerfProfile.log("PENDING_HINT_SUPERSEDED page=%d paint=%d",
-            self._pending_hint.pageno, pageno)
         self._pending_hint = nil
     end
 end
@@ -723,13 +704,6 @@ Draw page content to blitbuffer.
 function Document:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, saturation)
     self:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturation)
     local tile = self:renderPage(pageno, rect, zoom, rotation, gamma, saturation)
-    -- TEMP DIAGNOSTIC (round 3.6): pin down the served tile's excerpt vs the
-    -- requested rect on ink-offset pages (right-edge cut investigation).
-    if PerfProfile.enabled then
-        PerfProfile.log("DRAW_TILE page=%d rect=%s excerpt=%s bb=%dx%d",
-            pageno, tostring(rect), tostring(tile and tile.excerpt),
-            tile and tile.bb.w or -1, tile and tile.bb.h or -1)
-    end
     -- Enable SW dithering if requested (only available in koptoptions)
     if self.sw_dithering then
         target:ditherblitFrom(tile.bb,
