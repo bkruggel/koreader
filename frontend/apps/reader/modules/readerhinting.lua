@@ -1,6 +1,5 @@
 local EventListener = require("ui/widget/eventlistener")
 local Geom = require("ui/geometry")
-local PerfProfile = require("perfprofile")
 local UIManager = require("ui/uimanager")
 
 local DHINTCOUNT = G_defaults:readSetting("DHINTCOUNT")
@@ -58,11 +57,8 @@ function ReaderHinting:onHintPage(_, opportunistic)
             end
         end
         if job and not job_useful then
-            PerfProfile.log("HINT_CYCLE_CANCELLED_STALE_JOB page=%d", job.pageno)
             doc:_abortInFlightJob()
         else
-            PerfProfile.log("HINT_CYCLE_DEFERRED_BUSY opportunistic=%s",
-                tostring(opportunistic))
             self:_scheduleHintRetry(opportunistic)
             return true
         end

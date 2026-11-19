@@ -19,7 +19,6 @@ local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local dbg = require("dbg")
 local logger = require("logger")
-local PerfProfile = require("perfprofile")
 local optionsutil = require("ui/data/optionsutil")
 local Size = require("ui/size")
 local time = require("ui/time")
@@ -385,7 +384,6 @@ end
 function ReaderView:drawScrollPages(bb, x, y)
     local pos = Geom:new{x = x , y = y}
     for page, state in ipairs(self.page_states) do
-        local perf_t0 = PerfProfile.enabled and PerfProfile.now()
         self.document:drawPage(
             bb,
             pos.x + state.offset.x,
@@ -396,9 +394,6 @@ function ReaderView:drawScrollPages(bb, x, y)
             state.rotation,
             state.gamma,
             state.saturation)
-        if perf_t0 then
-            PerfProfile.log("PAINT_PAGE_MS page=%d duration=%.2f", state.page, PerfProfile.now() - perf_t0)
-        end
         pos.y = pos.y + state.visible_area.h
         -- draw page gap if not the last part
         if page ~= #self.page_states then
@@ -464,7 +459,6 @@ function ReaderView:drawPageGap(bb, x, y)
 end
 
 function ReaderView:drawSinglePage(bb, x, y)
-    local perf_t0 = PerfProfile.enabled and PerfProfile.now()
     self.document:drawPage(
         bb,
         x + self.state.offset.x,
@@ -475,9 +469,6 @@ function ReaderView:drawSinglePage(bb, x, y)
         self.state.rotation,
         self.state.gamma,
         self.state.saturation)
-    if perf_t0 then
-        PerfProfile.log("PAINT_PAGE_MS page=%d duration=%.2f", self.state.page, PerfProfile.now() - perf_t0)
-    end
     UIManager:nextTick(self.emitHintPageEvent)
 end
 
@@ -793,14 +784,6 @@ function ReaderView:recalculate()
             self.state.page,
             self.state.zoom,
             self.state.rotation)
-        -- TEMP DIAGNOSTIC (round 3.5): device "cropped view after turn"
-        -- report; log the geometry the view actually anchors to.
-        if PerfProfile.enabled then
-            PerfProfile.log("VIEW_GEOM page=%d zoom=%.3f use_bbox=%s page_area=%.0fx%.0f+%d+%d visible=%.0fx%.0f+%d+%d",
-                self.state.page, self.state.zoom, tostring(self.use_bbox),
-                self.page_area.w, self.page_area.h, self.page_area.x, self.page_area.y,
-                self.visible_area.w, self.visible_area.h, self.visible_area.x, self.visible_area.y)
-        end
         -- reset our size
         self.visible_area:setSizeTo(self.dimen)
         if self.footer_visible and not self.footer.settings.reclaim_height then
