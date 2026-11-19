@@ -427,10 +427,11 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
 
     -- Phase 4a: commit or release a worker job whose state already settled
     -- (completion can lag the 20 ms poller by a tick) so the lookups below
-    -- can hit the tile it produced (round 3.9). Prescaled fragment requests
-    -- bypass the async engine entirely.
+    -- can hit the tile it produced (round 3.9). Suppress auto-dispatch of any
+    -- parked _pending_hint so a cache miss below never races a newly launched
+    -- background job. Prescaled fragment requests bypass the async engine.
     if not is_prescaled and self._drainFinishedWorker then
-        self:_drainFinishedWorker()
+        self:_drainFinishedWorker(true)
     end
 
     local hash, hash_excerpt, tile
@@ -591,10 +592,10 @@ end
 -- rasterizing all quadrants in the worker would just stall the next tap),
 -- and whenever the document backend supports it the hint is dispatched to
 -- the background worker, keeping the main thread free either way.
--- When dispatch_only is set (opportunistic re-hints fired outside the paint
--- cycle, c.f., ReaderView:PanningUpdate), a busy or unavailable worker means
--- the hint is skipped entirely instead of falling back to the synchronous
--- path: it must never abort an in-flight job nor block the main thread.
+-- When dispatch_only is set (secondary hint slots or opportunistic hints),
+-- a busy or unavailable worker means the hint is parked/skipped instead of
+-- falling back to the synchronous path: it must never abort an in-flight
+-- job nor block the main thread.
 function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only, use_bbox)
     logger.dbg("hinting page", pageno)
     local perf_t0 = PerfProfile.enabled and PerfProfile.now()
@@ -694,20 +695,12 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
     end
 end
 
---[[
-Draw page content to blitbuffer.
-1. find tile in cache
-2. if not found, call renderPage
-
-@target: target blitbuffer
-@rect: visible_area inside document page
---]]
-function Document:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, saturation)
+function Document:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturation)
     -- The caller is painting this view right now: remember it as the
     -- *active view*, the reference the async engine uses to tell whether an
     -- in-flight job is still worth running (c.f., PdfDocument:_jobStillRelevant).
-    -- A paint also supersedes any opportunistic hint parked for an older
-    -- state: whatever it predicted is stale the moment this view is shown.
+    -- A paint also supersedes any hint parked for an older state: whatever it
+    -- predicted is stale the moment this view is shown.
     self._active_view = {
         pageno = pageno, rect = rect, zoom = zoom,
         rotation = rotation, gamma = gamma, saturation = saturation,
@@ -717,6 +710,18 @@ function Document:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, sa
             self._pending_hint.pageno, pageno)
         self._pending_hint = nil
     end
+end
+
+--[[
+Draw page content to blitbuffer.
+1. find tile in cache
+2. if not found, call renderPage
+
+@target: target blitbuffer
+@rect: visible_area inside document page
+--]]
+function Document:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, saturation)
+    self:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturation)
     local tile = self:renderPage(pageno, rect, zoom, rotation, gamma, saturation)
     -- TEMP DIAGNOSTIC (round 3.6): pin down the served tile's excerpt vs the
     -- requested rect on ink-offset pages (right-edge cut investigation).
@@ -742,6 +747,7 @@ function Document:drawPage(target, x, y, rect, pageno, zoom, rotation, gamma, sa
 end
 
 function Document:drawPageInverted(target, x, y, rect, pageno, zoom, rotation, gamma, saturation)
+    self:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturation)
     local tile = self:renderPage(pageno, rect, zoom, rotation, gamma, saturation)
     target:invertblitFrom(tile.bb,
         x, y,

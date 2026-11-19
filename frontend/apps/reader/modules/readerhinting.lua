@@ -1,9 +1,14 @@
 local EventListener = require("ui/widget/eventlistener")
 local Geom = require("ui/geometry")
 local PerfProfile = require("perfprofile")
-local pdf = require("ffi/mupdf")
+local UIManager = require("ui/uimanager")
 
 local DHINTCOUNT = G_defaults:readSetting("DHINTCOUNT")
+
+local function isWorkerRunning()
+    local pdf = package.loaded["ffi/mupdf"]
+    return pdf and pdf.workerStatus() == pdf.WORKER_RUNNING
+end
 
 local ReaderHinting = EventListener:extend{
     hinting_states = nil, -- array
@@ -15,6 +20,14 @@ end
 
 function ReaderHinting:onHintPage(_, opportunistic)
     if not self.view.hinting then return true end
+    if self._hint_retry_fn then
+        UIManager:unschedule(self._hint_retry_fn)
+        self._hint_retry_fn = nil
+    end
+    local doc = self.document
+    if doc._drainFinishedWorker then
+        doc:_drainFinishedWorker(true)
+    end
     -- A cycle that starts with the worker mid-job cannot produce dispatchable
     -- params: the bbox probes it needs would either defer (answering with the
     -- stored/full-page bbox → a zoom/rect pair the next paint can never
@@ -22,14 +35,30 @@ function ReaderHinting:onHintPage(_, opportunistic)
     -- rasterizes). A paint whose tile was cached returns before resolving
     -- the in-flight job, so this legitimately happens; when the running job
     -- targets a superseded view, cancel it and proceed right away — when it
-    -- is still the likely next view, retry the cycle once the worker
-    -- settles instead of leaving the new view unhinted (round 3.9).
-    if pdf.workerStatus() == pdf.WORKER_RUNNING then
-        local doc = self.document
-        if doc._in_flight_job and doc._jobStillRelevant
-                and not doc:_jobStillRelevant(doc._in_flight_job) then
-            PerfProfile.log("HINT_CYCLE_CANCELLED_STALE_JOB page=%d",
-                doc._in_flight_job.pageno)
+    -- is still the likely next view (current page pan or adjacent page in the
+    -- active reading direction), retry the cycle once the worker settles
+    -- instead of killing a valid prefetch or leaving the new view unhinted.
+    if isWorkerRunning() then
+        local job = doc._in_flight_job
+        local dir = (self.ui.paging and self.ui.paging.last_view_rel_diff) or 1
+        local cur_page = self.view.state.page
+        local job_useful = false
+        if job then
+            if doc._jobStillRelevant and doc:_jobStillRelevant(job) then
+                job_useful = true
+            elseif cur_page
+                    and job.rotation == self.view.state.rotation
+                    and job.gamma == self.view.state.gamma
+                    and job.saturation == self.view.state.saturation then
+                if job.pageno == cur_page and job.zoom == self.view.state.zoom then
+                    job_useful = true
+                elseif job.pageno == cur_page + dir then
+                    job_useful = true
+                end
+            end
+        end
+        if job and not job_useful then
+            PerfProfile.log("HINT_CYCLE_CANCELLED_STALE_JOB page=%d", job.pageno)
             doc:_abortInFlightJob()
         else
             PerfProfile.log("HINT_CYCLE_DEFERRED_BUSY opportunistic=%s",
@@ -160,7 +189,7 @@ function ReaderHinting:_scheduleHintRetry(opportunistic, attempt)
         if not self.ui or not self.view or not self.view.hinting then
             return
         end
-        if pdf.workerStatus() == pdf.WORKER_RUNNING then
+        if isWorkerRunning() then
             self:_scheduleHintRetry(opportunistic, attempt)
             return
         end

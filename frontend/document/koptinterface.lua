@@ -234,30 +234,26 @@ function KoptInterface:getAutoBBox(doc, pageno, defer_busy)
         -- evaluation, nothing is cached, and the next zoom evaluation of
         -- this page retries (the worker is idle by then in the common case,
         -- since hint jobs are aborted/coalesced around user interactions).
-        local pdf = require("ffi/mupdf")
-        if defer_busy then
-            if pdf.workerStatus() == pdf.WORKER_RUNNING then
-                PerfProfile.log("BBOX_PROBE_DEFERRED page=%d", pageno)
-                return Document.getPageBBox(doc, pageno)
-            end
-        elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
-            -- The caller cannot retry later (active-page zoom decision,
-            -- reflow pipeline): it would have raced the background
-            -- rasterization job with openPage + getPagePix here. Cancel the
-            -- job instead and wait until the worker has actually stopped —
-            -- the cooperative abort lands at the next render/saturation
-            -- checkpoint, so this blocks for milliseconds, not seconds
-            -- (round 3.8). The stale job's bookkeeping is released by its
-            -- own poller on the next UIManager tick.
-            PerfProfile.log("BBOX_PROBE_CANCEL_WORKER page=%d", pageno)
-            pdf.workerAbort()
-            pdf.workerWait(-1)
-            -- The abort landed without any poller tick: release the stale
-            -- job's bookkeeping now (or commit it, if it had already
-            -- finished before our cancel), so later worker-state checks
-            -- don't treat the idle worker as busy (round 3.9).
-            if doc._drainFinishedWorker then
-                doc:_drainFinishedWorker()
+        local pdf = doc.is_pdf and package.loaded["ffi/mupdf"]
+        if pdf then
+            if defer_busy then
+                if pdf.workerStatus() == pdf.WORKER_RUNNING then
+                    PerfProfile.log("BBOX_PROBE_DEFERRED page=%d", pageno)
+                    return Document.getPageBBox(doc, pageno)
+                end
+            elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
+                -- The caller cannot retry later (active-page zoom decision,
+                -- reflow pipeline): cancel the worker and wait until it has
+                -- stopped without launching any parked _pending_hint so the
+                -- worker stays idle across openPage + getPagePix below.
+                PerfProfile.log("BBOX_PROBE_CANCEL_WORKER page=%d", pageno)
+                if doc._abortInFlightJob then
+                    doc:_abortInFlightJob()
+                end
+                if pdf.workerStatus() == pdf.WORKER_RUNNING then
+                    pdf.workerAbort()
+                    pdf.workerWait(-1)
+                end
             end
         end
         local perf_t0 = PerfProfile.enabled and PerfProfile.now()
@@ -301,18 +297,22 @@ function KoptInterface:getSemiAutoBBox(doc, pageno, defer_busy)
     if not cached then
         -- Same worker-race handling as getAutoBBox above; the user's
         -- restricted bbox is the fallback until the probe can run.
-        local pdf = require("ffi/mupdf")
-        if defer_busy then
-            if pdf.workerStatus() == pdf.WORKER_RUNNING then
-                PerfProfile.log("SEMIAUTO_PROBE_DEFERRED page=%d", pageno)
-                return bbox
-            end
-        elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
-            PerfProfile.log("SEMIAUTO_PROBE_CANCEL_WORKER page=%d", pageno)
-            pdf.workerAbort()
-            pdf.workerWait(-1)
-            if doc._drainFinishedWorker then
-                doc:_drainFinishedWorker()
+        local pdf = doc.is_pdf and package.loaded["ffi/mupdf"]
+        if pdf then
+            if defer_busy then
+                if pdf.workerStatus() == pdf.WORKER_RUNNING then
+                    PerfProfile.log("SEMIAUTO_PROBE_DEFERRED page=%d", pageno)
+                    return bbox
+                end
+            elseif pdf.workerStatus() == pdf.WORKER_RUNNING then
+                PerfProfile.log("SEMIAUTO_PROBE_CANCEL_WORKER page=%d", pageno)
+                if doc._abortInFlightJob then
+                    doc:_abortInFlightJob()
+                end
+                if pdf.workerStatus() == pdf.WORKER_RUNNING then
+                    pdf.workerAbort()
+                    pdf.workerWait(-1)
+                end
             end
         end
         local page = doc._document:openPage(pageno)
@@ -673,7 +673,7 @@ function KoptInterface:renderOptimizedPage(doc, pageno, rect, zoom, rotation, hi
     return tile
 end
 
-function KoptInterface:hintPage(doc, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
+function KoptInterface:hintPage(doc, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only, use_bbox)
     --- @note: Crappy safeguard around memory issues like in #7627: if we're eating too much RAM, drop half the cache...
     DocCache:memoryPressureCheck()
 
@@ -682,7 +682,7 @@ function KoptInterface:hintPage(doc, pageno, zoom, rotation, gamma, saturation, 
     elseif self:is_optimizing_page(doc) then
         self:renderOptimizedPage(doc, pageno, nil, zoom, rotation, true)
     else
-        Document.hintPage(doc, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only)
+        Document.hintPage(doc, pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only, use_bbox)
     end
 end
 

@@ -329,9 +329,12 @@ userpatch.applyPatches(userpatch.on_exit)
 -- is otherwise still alive while LuaJIT's finalizers release the MuPDF
 -- objects it holds references to (display lists, the shared lock state),
 -- which segfaults the process intermittently at exit when a job was still
--- in flight (round 3.9). No-op if the worker was never started.
+-- in flight (round 3.9). Only touch ffi/mupdf if it was loaded this session.
 pcall(function()
-    require("ffi/mupdf").workerShutdown()
+    local pdf = package.loaded["ffi/mupdf"]
+    if pdf and pdf.workerShutdown then
+        pdf.workerShutdown()
+    end
 end)
 
 -- Close the Lua state on exit
