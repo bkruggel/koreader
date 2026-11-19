@@ -293,16 +293,11 @@ function Document:getPageBBox(pageno)
     return bbox
 end
 
---[[
-This method returns pagesize if bbox is corrupted
---]]
--- @tfield bool defer_busy when true and the background rasterization worker
--- is mid-job, a needed bbox probe is *deferred* (stored/full-page bbox
--- returned, nothing cached) instead of rendering the page on the main thread
--- while the worker runs — two page-consuming MuPDF operations in flight at
--- once. Used by the zoom/hint decision paths, where a probe can always be
--- retried on a later evaluation; the reflow pipeline needs pixels now and
--- never sets this.
+--- Compute scaled content bounding box dimensions (falls back to full page if invalid).
+-- @tparam int pageno
+-- @tparam number zoom
+-- @tparam number rotation
+-- @tparam[opt] bool defer_busy defer uncached bbox probes while the background worker is running
 function Document:getUsedBBoxDimensions(pageno, zoom, rotation, defer_busy)
     local bbox = self:getPageBBox(pageno, defer_busy)
     -- clipping page bbox
@@ -391,15 +386,13 @@ end
 
 function Document:setTileCacheValidity(ts)
     self.tile_cache_validity_ts = ts
-    -- Restored validity may make already-committed tiles stale: allow the
-    -- async path to re-dispatch them (c.f., PdfDocument:hintPageAsync).
+    -- Cached tiles may be stale after restoring validity; allow re-hinting.
     self._last_committed_hash = nil
 end
 
 function Document:resetTileCacheValidity()
     self.tile_cache_validity_ts = os.time()
-    -- Page content changed (highlights, etc.): cached tiles are stale, so
-    -- don't suppress re-hinting of an identical target.
+    -- Content changed (e.g., annotations); allow re-hinting identical targets.
     self._last_committed_hash = nil
 end
 
@@ -424,11 +417,8 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
     -- If rect contains a nested scaled_rect object, our caller handled scaling itself (e.g., drawPagePart)
     local is_prescaled = rect and rect.scaled_rect ~= nil or false
 
-    -- Phase 4a: commit or release a worker job whose state already settled
-    -- (completion can lag the 20 ms poller by a tick) so the lookups below
-    -- can hit the tile it produced (round 3.9). Suppress auto-dispatch of any
-    -- parked _pending_hint so a cache miss below never races a newly launched
-    -- background job. Prescaled fragment requests bypass the async engine.
+    -- Commit any finished background worker job before checking DocCache,
+    -- suppressing _pending_hint dispatch until cache resolution completes.
     if not is_prescaled and self._drainFinishedWorker then
         self:_drainFinishedWorker(true)
     end
@@ -460,20 +450,13 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
         end
     end
 
-    -- Phase 4b: cache miss — only NOW resolve against a possibly in-flight
-    -- background hint (coalesce with it, or cancel it when it renders an
-    -- obsolete target). This used to run before the cache lookups, which
-    -- made every paint whose tile was ALREADY cached abort an in-flight
-    -- hint for a *future* view (e.g. the next pan segment, just dispatched
-    -- by the previous cycle) and block on the cancellation — before
-    -- immediately finding the tile one line later (round 3.9).
+    -- On a cache miss, coalesce with a matching in-flight hint or abort an obsolete one.
     if not is_prescaled and self.resolveInFlightHint then
         local resolved = self:resolveInFlightHint(pageno, rect, zoom, rotation, gamma, saturation, hinting)
         if resolved == "covered" then
             return
         end
         if resolved == "committed" then
-            -- The coalesced job just landed its tile: re-run the lookups.
             tile = DocCache:check(hash, TileCacheItem)
             if not tile and hash_excerpt then
                 tile = DocCache:check(hash_excerpt)
@@ -575,36 +558,22 @@ function Document:renderPage(pageno, rect, zoom, rotation, gamma, saturation, hi
     return tile
 end
 
--- a hint for the cache engine to paint a full page to the cache
---- @todo this should trigger a background operation
--- Phase 2/4: full-page hints that DocCache would silently reject are clipped
--- to the viewport instead (the caller may pass the view's visible_area as
--- hint_rect so the excerpt matches the next paint exactly), as are hints for
--- zoomed pages much larger than the screen (multi-step panned views, e.g.
--- 2-column zooms: only a viewport excerpt is painted per interaction, so
--- rasterizing all quadrants in the worker would just stall the next tap),
--- and whenever the document backend supports it the hint is dispatched to
--- the background worker, keeping the main thread free either way.
--- When dispatch_only is set (secondary hint slots or opportunistic hints),
--- a busy or unavailable worker means the hint is parked/skipped instead of
--- falling back to the synchronous path: it must never abort an in-flight
--- job nor block the main thread.
+--- Pre-render a page (or viewport excerpt when oversized) into the tile cache,
+-- preferring asynchronous background rasterization when supported.
+-- @tparam int pageno
+-- @tparam number zoom
+-- @tparam number rotation
+-- @tparam number gamma
+-- @tparam number saturation
+-- @tparam[opt] Geom hint_rect target viewport rect when clipping oversized pages
+-- @tparam[opt] bool dispatch_only park or skip instead of running synchronously if busy
+-- @tparam[opt] bool use_bbox whether the view crops this page to its content bbox
 function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect, dispatch_only, use_bbox)
     logger.dbg("hinting page", pageno)
 
     local rect = nil
-    -- When the view crops this page to its content bbox (the zoom was chosen
-    -- to fill the screen with that area), the size that matters is the
-    -- *cropped* area: the native page at a cropped zoom spans several
-    -- screens, which would wrongly force excerpt-mode hints and clamp
-    -- hint_rect against the native page's origin instead of the cropped
-    -- area's — a rect the first paint after the turn can never request
-    -- (round 3.7).
-    -- A rect==nil hint allocates the *uncropped* page (hintPageAsync sizes
-    -- its buffer from getPageDimensions), so the cache budget is checked
-    -- against that allocation, not the cropped area — otherwise a tile the
-    -- cache silently drops at commit time would be rasterized in full
-    -- (round 3.8).
+    -- Check cache budget against the uncropped page allocation (used when
+    -- rect == nil), while sizing excerpt bounds from the cropped page area.
     local full_page_size = self:getPageDimensions(pageno, zoom, rotation)
     local page_size
     if use_bbox then
@@ -616,23 +585,12 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
     local screen_area = CanvasContext:getWidth() * CanvasContext:getHeight()
     local reason
     if not DocCache:willAccept(needed_bytes) then
-        -- Rendering the full page would only block the main thread and then
-        -- have its result thrown away by DocCache. Hint the viewport instead.
         reason = "cache"
     elseif page_size.w * page_size.h > 1.5 * screen_area then
-        -- The full page fits the cache but spans several screens at this
-        -- zoom: the next interaction still paints a single viewport, and a
-        -- full-page worker job would keep the worker (and any coalescing
-        -- wait) busy for all of them.
         reason = "zoom"
     end
     if reason then
-        -- hint_rect and page_size both live in zoomed document pixels, but a
-        -- cropped page's Geom carries a NON-ZERO origin (the bbox left/top
-        -- margin): clamp against the bbox's absolute bounds, not its w/h —
-        -- otherwise every rect below/right of the origin is shifted and
-        -- shrunk by the margin, and column 2 rects can even end up with a
-        -- negative width (round 3.8).
+        -- Clamp against absolute page bounds (page_size.x/y may be non-zero when cropped).
         local px = page_size.x or 0
         local py = page_size.y or 0
         local limit_x = px + page_size.w
@@ -647,11 +605,6 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
                 h = math.min(hint_rect.h, limit_y - ry),
             }
         else
-            -- No view-provided rect: clip to the visible screen. Note that
-            -- renderPage rects are in zoomed document pixels, which map 1:1
-            -- to screen pixels (the page is rasterized at screen resolution).
-            -- Anchor at the page area's origin: for a cropped page that is
-            -- the bbox origin, the frame the first paint requests in.
             rect = Geom:new{
                 x = px,
                 y = py,
@@ -661,12 +614,6 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
         end
     end
 
-    -- Phase 4: prefer the background worker (dispatch is a few ms of display
-    -- list building; rasterization happens off-thread). Fall back to the
-    -- synchronous path when this backend has no async support or the worker
-    -- is already busy; renderPage's resolve hook then coalesces with the
-    -- in-flight job instead of duplicating it. (Backends with async support
-    -- handle dispatch_only internally by parking the hint while busy.)
     if self.hintPageAsync and self:hintPageAsync(pageno, rect, zoom, rotation, gamma, saturation, dispatch_only) then
         return
     end
@@ -679,11 +626,6 @@ function Document:hintPage(pageno, zoom, rotation, gamma, saturation, hint_rect,
 end
 
 function Document:_recordActiveView(pageno, rect, zoom, rotation, gamma, saturation)
-    -- The caller is painting this view right now: remember it as the
-    -- *active view*, the reference the async engine uses to tell whether an
-    -- in-flight job is still worth running (c.f., PdfDocument:_jobStillRelevant).
-    -- A paint also supersedes any hint parked for an older state: whatever it
-    -- predicted is stale the moment this view is shown.
     self._active_view = {
         pageno = pageno, rect = rect, zoom = zoom,
         rotation = rotation, gamma = gamma, saturation = saturation,
